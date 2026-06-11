@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "PubMed PDF 批次下載器 v6",
+  "version": "6.0.1",
+  "description": "批次下載 PubMed 論文 PDF，支援 CMU EZproxy 授權、並行下載、暫停/繼續",
+  "permissions": [
+    "downloads",
+    "tabs",
+    "scripting",
+    "storage",
+    "cookies",
+    "notifications",
+    "windows"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "https://pubmed.ncbi.nlm.nih.gov/*",
+    "https://pmc.ncbi.nlm.nih.gov/*",
+    "https://*.nih.gov/*",
+    "https://autorpa.cmu.edu.tw/*",
+    "https://*.autorpa.cmu.edu.tw:8443/*",
+    "https://*.elsevier.com/*",
+    "https://*.sciencedirect.com/*",
+    "https://*.wiley.com/*",
+    "https://*.springer.com/*"
+  ],
+  "action": {
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["xlsx.full.min.js", "exceljs.bare.min.js", "popup.html", "popup.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

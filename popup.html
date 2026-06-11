@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <title>PubMed PDF 批次下載器 v6</title>
+  <script src="xlsx.full.min.js"></script>
+  <script src="exceljs.bare.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Microsoft JhengHei", "Segoe UI", sans-serif;
+      width: 520px; min-height: 400px;
+      background: #f0f4f8; color: #1a2332;
+      font-size: 13px;
+    }
+
+    /* ── 頂部標題 ── */
+    .header {
+      background: linear-gradient(135deg, #1a3557, #2563a8);
+      color: white; padding: 12px 16px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .header h1 { font-size: 14px; font-weight: 700; }
+    .header .version { font-size: 10px; opacity: 0.7; }
+
+    /* ── 帳號登入區 ── */
+    .login-section {
+      background: #fff3cd; border-bottom: 2px solid #ffc107;
+      padding: 10px 14px; display: none;
+    }
+    .login-section.show { display: block; }
+    .login-title { font-weight: 700; color: #856404; margin-bottom: 8px; font-size: 12px; }
+    .login-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+    .login-row label { width: 45px; font-size: 12px; color: #666; flex-shrink: 0; }
+    .login-row input {
+      flex: 1; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px;
+      font-size: 12px; font-family: inherit;
+    }
+    .login-btn {
+      width: 100%; padding: 7px; background: #1a3557; color: white;
+      border: none; border-radius: 4px; font-size: 13px; font-family: inherit;
+      font-weight: 600; cursor: pointer; margin-top: 4px;
+    }
+    .login-btn:hover { background: #2563a8; }
+
+    /* ── 驗證碼區 ── */
+    .captcha-section {
+      background: #fff3cd; border-bottom: 2px solid #ffc107;
+      padding: 10px 14px; display: none;
+    }
+    .captcha-section.show { display: block; }
+    .captcha-title { font-weight: 700; color: #856404; margin-bottom: 6px; font-size: 12px; }
+    .captcha-img { border: 1px solid #ccc; border-radius: 4px; max-width: 200px; display: block; margin-bottom: 6px; }
+    .captcha-row { display: flex; gap: 6px; }
+    .captcha-row input { flex: 1; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+    .captcha-row button {
+      padding: 5px 12px; background: #2563a8; color: white;
+      border: none; border-radius: 4px; font-size: 12px; cursor: pointer;
+    }
+
+    /* ── 上傳區 ── */
+    .upload-area {
+      border: 2px dashed #aac; border-radius: 8px; padding: 16px;
+      text-align: center; cursor: pointer; background: white; margin: 10px;
+      transition: all 0.2s;
+    }
+    .upload-area:hover, .upload-area.drag-over { border-color: #2563a8; background: #e8f0fe; }
+    .upload-area .icon { font-size: 24px; margin-bottom: 4px; }
+    .upload-area p { font-size: 12px; color: #666; }
+    #fileInput { display: none; }
+
+    /* ── 統計欄位 ── */
+    .stats-grid {
+      display: grid; grid-template-columns: repeat(4, 1fr);
+      gap: 6px; padding: 0 10px 8px; display: none;
+    }
+    .stat-box {
+      background: white; border-radius: 6px; padding: 8px 4px;
+      text-align: center; border: 1px solid #dde;
+    }
+    .stat-box .num { font-size: 18px; font-weight: 700; }
+    .stat-box .lbl { font-size: 10px; color: #888; margin-top: 2px; }
+    .stat-box.total .num { color: #2563a8; }
+    .stat-box.ok    .num { color: #16a34a; }
+    .stat-box.fail  .num { color: #dc2626; }
+    .stat-box.skip  .num { color: #9333ea; }
+
+    /* ── 進度條 ── */
+    .progress-section { padding: 0 10px 6px; display: none; }
+    .progress-wrap { background: #e0e0e0; border-radius: 99px; height: 10px; overflow: hidden; }
+    .progress-bar { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #2563a8, #16a34a); transition: width 0.4s; width: 0%; }
+    .progress-label { font-size: 11px; color: #666; margin-top: 3px; text-align: right; }
+
+    /* ── 並行狀態 ── */
+    .workers-section { padding: 0 10px 6px; display: none; }
+    .workers-title { font-size: 11px; color: #666; margin-bottom: 4px; }
+    .worker-list { display: flex; flex-direction: column; gap: 3px; }
+    .worker-item {
+      background: white; border-radius: 4px; padding: 4px 8px;
+      font-size: 11px; border-left: 3px solid #ccc;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .worker-item.running { border-left-color: #2563a8; }
+    .worker-item.done    { border-left-color: #16a34a; }
+    .worker-item.fail    { border-left-color: #dc2626; }
+    .worker-item.idle    { border-left-color: #ccc; color: #aaa; }
+
+    /* ── 執行記錄（多 Tab） ── */
+    .log-section { padding: 0 10px 6px; display: none; }
+    .log-tab {
+      padding: 3px 10px; font-size: 11px; border: none;
+      border-radius: 4px 4px 0 0; cursor: pointer; font-family: inherit;
+      background: #333; color: #888; white-space: nowrap; flex-shrink: 0;
+      transition: background 0.15s, color 0.15s;
+    }
+    .log-tab.active { background: #1e1e1e; color: #93c5fd; }
+    .log-tab.has-fail { color: #fca5a5 !important; }
+    .log-tab.running::after { content: " ⚙"; font-size: 9px; }
+    .log-wrap {
+      background: #1e1e1e; border-radius: 0 0 6px 6px; padding: 6px 8px;
+      height: 130px; overflow-y: auto; display: none;
+    }
+    .log-wrap.active-log { display: block; }
+    .log-wrap p { font-size: 11px; line-height: 1.5; font-family: Consolas, monospace; color: #ccc; white-space: pre-wrap; }
+    .log-wrap p.ok     { color: #86efac; }
+    .log-wrap p.fail   { color: #fca5a5; }
+    .log-wrap p.warn   { color: #fde68a; }
+    .log-wrap p.info   { color: #93c5fd; }
+    .log-wrap p.bot    { color: #f0abfc; font-weight: bold; }
+    .thread-log-toggle {
+      position: fixed; right: 8px; bottom: 8px; z-index: 30;
+      width: auto; flex: initial; padding: 4px 7px; border-radius: 999px;
+      background: #111827; color: #9ca3af; border: 1px solid #374151;
+      font-size: 10px; opacity: 0.72;
+    }
+    .thread-log-panel {
+      display: none; position: fixed; right: 8px; bottom: 36px; z-index: 31;
+      width: 360px; max-width: calc(100vw - 16px); background: #111827;
+      border: 1px solid #374151; border-radius: 8px; box-shadow: 0 10px 28px rgba(0,0,0,0.35);
+      padding: 8px;
+    }
+    .thread-log-panel.open { display: block; }
+    .thread-log-head { display:flex; align-items:center; gap:6px; margin-bottom:6px; color:#d1d5db; font-size:11px; }
+    .thread-log-head span { flex:1; font-weight:700; }
+    .thread-log-head button {
+      width: auto; flex: initial; padding: 3px 6px; border-radius: 5px;
+      background:#374151; color:#e5e7eb; font-size:10px;
+    }
+    #threadLogText {
+      width: 100%; height: 180px; resize: vertical; box-sizing: border-box;
+      background:#0b1020; color:#cbd5e1; border:1px solid #334155; border-radius:6px;
+      padding:6px; font: 10px/1.45 Consolas, monospace; white-space: pre;
+    }
+
+    /* ── 按鈕列 ── */
+    .btn-row { display: flex; gap: 6px; padding: 8px 10px; }
+    button {
+      flex: 1; padding: 8px; border: none; border-radius: 6px;
+      font-size: 12px; font-family: inherit; font-weight: 600;
+      cursor: pointer; transition: opacity 0.2s;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-start  { background: #2563a8; color: white; }
+    .btn-pause  { background: #ea580c; color: white; }
+    .btn-resume { background: #16a34a; color: white; display: none; }
+    .btn-stop   { background: #dc2626; color: white; }
+    .btn-clear  { background: #e0e0e0; color: #333; }
+
+    /* ── 匯出 Excel 按鈕 ── */
+    #downloadExcelBtn {
+      display: none; width: calc(100% - 20px); margin: 0 10px 8px;
+      padding: 8px; background: #ea580c; color: white; border: none;
+      border-radius: 6px; font-size: 13px; font-family: inherit;
+      font-weight: 600; cursor: pointer;
+    }
+
+    /* ── 狀態列 ── */
+    .status-bar {
+      background: #1a3557; color: #93c5fd; padding: 4px 12px;
+      font-size: 11px; display: flex; justify-content: space-between;
+    }
+    .shortcut-hint { color: #64748b; font-size: 10px; }
+
+    .file-info {
+      background: #d1fae5; border-radius: 6px; padding: 5px 10px;
+      font-size: 11px; color: #065f46; margin: 0 10px 6px; display: none;
+    }
+
+    /* ── 並行與設定列 ── */
+    .settings-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 10px; background: white; border-bottom: 1px solid #eee;
+      display: none;
+    }
+    .settings-row label { font-size: 12px; color: #555; }
+    .settings-row select {
+      padding: 3px 6px; border: 1px solid #ccc; border-radius: 4px;
+      font-size: 12px; font-family: inherit;
+    }
+    .settings-row input {
+      padding: 3px 6px; border: 1px solid #ccc; border-radius: 4px;
+      font-size: 12px; font-family: inherit; min-width: 120px;
+    }
+    .settings-row .wide-input { flex: 1; min-width: 160px; }
+    .settings-row button {
+      padding: 3px 8px; border: 1px solid #bbb; border-radius: 4px;
+      background: #f8fafc; color: #334155; font-size: 12px; cursor: pointer;
+    }
+    .settings-row button:hover { background: #e2e8f0; }
+    .settings-row .delay-note { font-size: 10px; color: #999; }
+    .stat-box { cursor: pointer; }
+  </style>
+</head>
+<body>
+
+  <!-- 頂部標題 -->
+  <div class="header">
+    <h1>🚀 PubMed PDF 批次下載器</h1>
+    <span class="version">v6.0 | CMU EZproxy</span>
+  </div>
+
+  <!-- 帳號登入區（需要時顯示） -->
+  <div class="login-section" id="loginSection">
+    <div class="login-title">🔐 請輸入 CMU 圖書館帳號密碼</div>
+    <div id="loginNote" style="font-size:11px; margin-bottom:4px; min-height:16px;"></div>
+    <div class="login-row">
+      <label>帳號</label>
+      <input type="text" id="loginUsername" placeholder="學號（英文字母全大寫）" autocomplete="username">
+    </div>
+    <div class="login-row">
+      <label>密碼</label>
+      <input type="password" id="loginPassword" placeholder="密碼" autocomplete="current-password">
+    </div>
+    <!-- 驗證碼欄位（有驗證碼才顯示） -->
+    <div id="loginCaptchaWrap" style="display:none; margin-bottom:6px;">
+      <div style="font-size:11px; color:#666; margin-bottom:4px;">🔒 驗證碼</div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <img id="loginCaptchaImg" src="" alt="驗證碼"
+          style="border:1px solid #ccc; border-radius:4px; height:48px; cursor:pointer;"
+          title="點擊可放大">
+        <input type="text" id="loginCaptchaInput" placeholder="請輸入圖中文字"
+          style="flex:1; padding:5px 8px; border:1px solid #ccc; border-radius:4px; font-size:13px; letter-spacing:2px;">
+      </div>
+      <div style="font-size:10px; color:#999; margin-top:3px;">
+        ※驗證碼為數字+小寫字母組合，不分大小寫
+      </div>
+    </div>
+    <button class="login-btn" id="loginSubmitBtn">登入 CMU 圖書館</button>
+    <div style="font-size:10px; color:#856404; margin-top:6px; line-height:1.5;">
+      帳號說明：學生用校務入口網站帳號（英文全大寫）<br>
+      教職員工：身份證號碼（首位大寫）
+    </div>
+  </div>
+
+  <!-- 登入等待提示（使用者在另一視窗操作） -->
+  <div id="loginWaitSection" style="display:none; background:#fff3cd; border-bottom:2px solid #ffc107; padding:12px 14px;">
+    <div style="font-weight:700; color:#856404; font-size:13px; margin-bottom:6px;">
+      🔐 請在目前瀏覽器的視窗完成登入
+    </div>
+    <div style="font-size:12px; color:#666; line-height:1.8;">
+      1. 前往彈出的圖書館登入頁面<br>
+      2. 填入帳號、密碼、認證碼<br>
+      3. 點「登入」按鈕<br>
+      4. 登入成功後會自動繼續
+    </div>
+    <div style="font-size:11px; color:#999; margin-top:6px;">⏳ 等待登入完成（最多 3 分鐘）...</div>
+  </div>
+
+  <!-- 驗證碼區（偵測到時顯示） -->
+  <div class="captcha-section" id="captchaSection">
+    <div class="captcha-title">🔒 偵測到新驗證碼，請輸入後繼續</div>
+    <img class="captcha-img" id="captchaImg" src="" alt="驗證碼">
+    <div class="captcha-row">
+      <input type="text" id="captchaInput" placeholder="輸入圖中文字">
+      <button id="captchaSubmitBtn">繼續</button>
+    </div>
+  </div>
+
+  <!-- 上傳區 -->
+  <div class="upload-area" id="uploadArea">
+    <div class="icon">📂</div>
+    <p><strong>點擊</strong>或拖曳上傳 Excel 檔案（.xlsx）</p>
+    <p style="margin-top:3px; font-size:11px;">Column M = Y 者自動加入下載清單</p>
+    <input type="file" id="fileInput" accept=".xlsx">
+  </div>
+  <div class="file-info" id="fileInfo"></div>
+
+  <!-- 篩選模式（上傳後可設定） -->
+  <div style="padding: 4px 10px 6px; display:flex; align-items:center; gap:10px; background:#fff; border-bottom:1px solid #eee;">
+    <span style="font-size:12px; color:#555;">下載範圍：</span>
+    <label style="display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer;">
+      <input type="radio" name="filterMode" id="filterY" value="Y" checked>
+      <span>僅 Column M = Y（<span id="countY">-</span> 篇）</span>
+    </label>
+    <label style="display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer;">
+      <input type="radio" name="filterMode" id="filterAll" value="all">
+      <span>全部下載（<span id="countAll">-</span> 篇）</span>
+    </label>
+    <input type="hidden" id="downloadAllCheck">
+  </div>
+
+  <!-- 設定列（上傳後顯示） -->
+  <div class="settings-row" id="settingsRow">
+    <label>並行下載數：</label>
+    <select id="concurrentSelect">
+      <option value="1">1 篇（最安全）</option>
+      <option value="2">2 篇</option>
+      <option value="3" selected>3 篇（建議）</option>
+      <option value="5">5 篇（較快）</option>
+    </select>
+    <span class="delay-note">每篇間隔 2-4 秒隨機延遲</span>
+  </div>
+
+  <!-- 下載資料夾 -->
+  <div class="settings-row" id="folderRow">
+    <label>下載資料夾</label>
+    <input type="text" id="downloadFolderInput" class="wide-input" value="" placeholder="例如 PubMed_PDFs/子資料夾">
+    <button type="button" id="openDownloadSettingsBtn">下載設定</button>
+    <span class="delay-note">位於 Chrome 預設下載資料夾內</span>
+  </div>
+  <div class="settings-row" id="batchRow">
+    <label>批次資料夾</label>
+    <input type="number" id="batchSizeInput" min="0" value="0" placeholder="例如 20">
+    <span class="delay-note">0 = 不分批；設 n 時每 n 篇建立一個子資料夾</span>
+  </div>
+  <div class="settings-row" id="politeModeRow">
+    <label>保守模式</label>
+    <label style="display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer;">
+      <input type="checkbox" id="politeModeInput" checked>
+      <span>啟用</span>
+    </label>
+    <span class="delay-note">建議大量下載時開啟（限最多 2 篇並行、每篇 8-15 秒、每 25 篇休息 1-2 分鐘）</span>
+  </div>
+  <div class="settings-row" id="startFromRow">
+    <label>起始 PMID/title</label>
+    <input type="text" id="startFromInput" class="wide-input" placeholder="留空 = 從頭開始；填 PMID 或標題關鍵字可從中間繼續">
+  </div>
+  <div class="settings-row" id="stopAfterRow">
+    <label>處理後停止</label>
+    <input type="number" id="stopAfterInput" min="0" value="0" placeholder="例如 100" style="width:70px;">
+    <span class="delay-note">0 = 不限制；設 n 時，完成 n 篇（成功＋失敗均計）後自動停止</span>
+  </div>
+
+  <!-- 統計欄位 -->
+  <div class="stats-grid" id="statsGrid">
+    <div class="stat-box total"><div class="num" id="sTotal">0</div><div class="lbl">總數</div></div>
+    <div class="stat-box ok">  <div class="num" id="sOk">0</div><div class="lbl">成功</div></div>
+    <div class="stat-box fail"><div class="num" id="sFail">0</div><div class="lbl">失敗</div></div>
+    <div class="stat-box skip"><div class="num" id="sSkip">0</div><div class="lbl">未下載</div></div>
+  </div>
+
+  <!-- 結果明細 -->
+  <div id="resultDetailPanel" style="display:none; padding:8px 10px; background:#fff; border-bottom:1px solid #eee; max-height:180px; overflow:auto; font-size:11px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+      <strong id="resultDetailTitle">下載清單</strong>
+      <button type="button" id="resultDetailClose" style="border:0; background:transparent; cursor:pointer;">✕</button>
+    </div>
+    <div id="resultDetailList"></div>
+  </div>
+
+  <!-- 進度條 -->
+  <div class="progress-section" id="progressSection">
+    <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="progress-label" id="progressLabel">0 / 0</div>
+  </div>
+
+  <!-- 並行狀態 -->
+  <div class="workers-section" id="workersSection">
+    <div class="workers-title">⚙ 並行狀態</div>
+    <div class="worker-list" id="workerList"></div>
+  </div>
+
+  <!-- 執行記錄（多 Worker Tab） -->
+  <div class="log-section" id="logSection">
+    <!-- Tab 列 -->
+    <div id="logTabBar" style="display:flex;align-items:center;gap:2px;padding:4px 8px 0;background:#2a2a2a;border-radius:6px 6px 0 0;flex-wrap:nowrap;overflow-x:auto;">
+      <!-- 全域 tab -->
+      <button class="log-tab active" data-tab="-1" id="logTab-global"
+        style="padding:3px 10px;font-size:11px;border:none;border-radius:4px 4px 0 0;cursor:pointer;font-family:inherit;background:#1e1e1e;color:#93c5fd;white-space:nowrap;flex-shrink:0;">
+        🌐 全域
+      </button>
+      <!-- Worker tab 由 JS 動態產生 -->
+      <div id="logTabWorkers" style="display:flex;gap:2px;flex-shrink:0;"></div>
+      <!-- Worker 4+ 下拉選單（超過3個時出現） -->
+      <select id="logTabMore" style="display:none;padding:2px 4px;font-size:11px;border:1px solid #555;border-radius:4px;background:#333;color:#ccc;font-family:inherit;flex-shrink:0;">
+        <option value="">更多 Worker ▼</option>
+      </select>
+      <span style="flex:1;"></span>
+      <span class="log-clear" id="logClearBtn" style="font-size:10px;color:#666;cursor:pointer;padding:2px 6px;flex-shrink:0;">清除</span>
+    </div>
+    <!-- Log 內容區（每個 tab 一個 div） -->
+    <div id="logPanels">
+      <div class="log-wrap active-log" id="logWrap-global" style="border-radius:0 0 6px 6px;"></div>
+      <!-- Worker log panels 由 JS 動態產生 -->
+    </div>
+  </div>
+
+  <!-- 按鈕 -->
+  <div class="btn-row">
+    <button class="btn-start"  id="startBtn"  disabled>▶ 開始</button>
+    <button class="btn-pause"  id="pauseBtn"  disabled>⏸ 下載暫停</button>
+    <button class="btn-resume" id="resumeBtn" disabled>▶ 繼續</button>
+    <button class="btn-stop"   id="stopBtn"   disabled>⏹ 下載結束</button>
+    <button class="btn-clear"  id="clearBtn">🔄 重設</button>
+  </div>
+
+  <div style="display:flex;gap:6px;padding:0 10px 6px;">
+    <button id="downloadExcelBtn" style="flex:1;display:none;padding:8px;background:#ea580c;color:white;border:none;border-radius:6px;font-size:13px;font-family:inherit;font-weight:600;cursor:pointer;">💾 下載進度管理 Excel</button>
+    <button id="progressTableBtn" style="flex:1;display:none;padding:8px;background:#2563a8;color:white;border:none;border-radius:6px;font-size:13px;font-family:inherit;font-weight:600;cursor:pointer;">📋 查看下載進度</button>
+  </div>
+
+  <button id="clearStorageBtn" style="margin:0 10px 6px;width:calc(100% - 20px);display:block;background:none;border:1px dashed #ccc;border-radius:6px;padding:5px;font-size:11px;color:#999;cursor:pointer;font-family:inherit;">🗑 清除 Storage 完成紀錄，重新開始</button>
+
+  <button id="threadLogToggle" class="thread-log-toggle" title="維護用紀錄，預設不顯示">thread log</button>
+  <div id="threadLogPanel" class="thread-log-panel" aria-hidden="true">
+    <div class="thread-log-head">
+      <span>thread log（維護用）</span>
+      <button id="threadLogCopyBtn" type="button">複製</button>
+      <button id="threadLogClearBtn" type="button">清空畫面</button>
+      <button id="threadLogCloseBtn" type="button">關閉</button>
+    </div>
+    <textarea id="threadLogText" readonly spellcheck="false" placeholder="維護用 trace 會出現在這裡，平常不用看。"></textarea>
+  </div>
+
+  <!-- 進度表格面板 -->
+  <div id="progressTablePanel" style="display:none; border-top:2px solid #2563a8;">
+    <div style="background:#1a3557;color:white;padding:8px 12px;display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:12px;font-weight:700;">📋 下載進度表</span>
+      <button id="progressTableClose" style="border:0;background:transparent;color:white;cursor:pointer;font-size:14px;">✕</button>
+    </div>
+    <div id="ptSummaryBar" style="background:#e8f0fe;padding:5px 12px;font-size:11px;color:#1a3557;border-bottom:1px solid #c7d7f5;">
+      ✅ 成功 0　❌ 失敗 0　⚪ 跳過 0　⏳ 未下載 0　共 0 篇
+    </div>
+    <div style="background:#fff;padding:6px 8px;display:flex;gap:8px;align-items:center;">
+      <input id="ptSearch" placeholder="搜尋 PMID 或標題" style="padding:3px 7px;border:1px solid #ccc;border-radius:4px;font-size:11px;width:150px;">
+      <select id="ptFilter" style="padding:3px 5px;border:1px solid #ccc;border-radius:4px;font-size:11px;">
+        <option value="all">全部</option>
+        <option value="下載成功">成功</option>
+        <option value="下載失敗">失敗</option>
+        <option value="未下載">未下載</option>
+        <option value="跳過">跳過</option>
+      </select>
+      <button id="progressTableClose2" style="background:rgba(255,255,255,0.2);border:none;color:#999;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;">✕ 收起</button>
+    </div>
+    <div style="max-height:300px;overflow-y:auto;">
+      <table id="ptTable" style="width:100%;border-collapse:collapse;font-size:11px;">
+        <thead>
+          <tr style="background:#0f4f8f;color:white;position:sticky;top:0;">
+            <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #dde;width:80px;">PMID</th>
+            <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #dde;">標題</th>
+            <th style="padding:5px 8px;text-align:center;border-bottom:1px solid #dde;width:70px;">狀態</th>
+          </tr>
+        </thead>
+        <tbody id="ptBody"></tbody>
+      </table>
+    </div>
+    <div style="padding:5px 12px;font-size:10px;color:#999;background:#f8fafc;border-top:1px solid #eee;">
+      顯示 <span id="ptCount">0</span> / <span id="ptTotal">0</span> 篇
+    </div>
+  </div>
+
+  <!-- 狀態列 -->
+  <div class="status-bar">
+    <span id="statusText">請上傳 Excel 檔案</span>
+    <span class="shortcut-hint">Alt+S = 暫停/繼續</span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
