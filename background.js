@@ -1871,7 +1871,10 @@ function isCmuProxyUrl(url) {
 
 function isCmuProxyCookieDomain(domain) {
   const host = String(domain || "").replace(/^\./, "").toLowerCase();
-  return host === "cmu.edu.tw" || host.endsWith(".cmu.edu.tw");
+  // 只保護真正的 CMU/EZproxy 登入域，不保護出版商 proxy 子域
+  // 出版商 proxy 子域格式：onlinelibrary-wiley-com.autorpa.cmu.edu.tw（含 .autorpa.）
+  if (host.endsWith(".autorpa.cmu.edu.tw")) return false;
+  return host === "autorpa.cmu.edu.tw" || host === "cmu.edu.tw" || host.endsWith(".cmu.edu.tw");
 }
 
 function isTrackingCookieName(name) {
