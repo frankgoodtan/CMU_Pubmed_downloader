@@ -1783,6 +1783,12 @@ async function getPdfFromPmc(tabId, url) {
 
 async function getPdfFromWiley(tabId, url) {
   const finalUrl = await navigateAndWaitStable(tabId, url, 3500, 22000);
+
+  // Proxy redirect loop？cookie 清理後重試，不繼續刮 16 秒
+  const recoveredFromLoop = await recoverPdfFromRedirectLoop(tabId);
+  if (recoveredFromLoop) return recoveredFromLoop;
+  if (G.cookieCleanupRequested) return null;
+
   const deadline = Date.now() + 16000;
   const candidates = buildPdfCandidatesFromUrl(finalUrl);
   const addCandidate = (href, baseUrl = finalUrl) => {
@@ -2093,6 +2099,9 @@ async function recoverPdfFromRedirectLoop(tabId) {
 
     const state = r?.[0]?.result;
     if (!state?.isRedirectLoop || !state.failedUrl || !isCmuProxyUrl(state.failedUrl)) return null;
+
+    // Cookie 導致 redirect loop，排程清理並要求重試此項目
+    requestCookieCleanup("proxy 連線錯誤，需要清理後重試");
 
     const restoredUrl = restoreCmuProxyUrl(state.failedUrl);
     const candidates = restoredUrl ? buildPdfCandidatesFromUrl(restoredUrl) : [];
