@@ -1086,7 +1086,7 @@ function getPublisherLockKey(urlOrHost = "", label = "") {
       ["pubmed", ["pubmed-ncbi-nlm-nih-gov", "pubmed.ncbi.nlm.nih.gov"]],
       ["doi", ["doi-org", "dx-doi-org", "doi.org", "dx.doi.org"]],
       ["cmulib", ["serialssolutions", "search-serialssolutions"]],
-      ["wiley", ["wiley", "onlinelibrary-wiley-com"]],
+      ["wiley", ["wiley", "onlinelibrary-wiley-com", "hindawi", "downloads-hindawi-com"]],
       ["springer", ["springer", "link-springer-com"]],
       ["elsevier", ["elsevier", "sciencedirect", "linkinghub-elsevier-com", "www-sciencedirect-com"]],
       ["sage", ["sagepub", "journals-sagepub-com"]],
