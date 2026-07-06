@@ -8,9 +8,11 @@
     "tabs",
     "scripting",
     "storage",
+    "unlimitedStorage",
     "cookies",
     "notifications",
-    "windows"
+    "windows",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>",

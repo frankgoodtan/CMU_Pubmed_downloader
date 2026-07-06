@@ -28,6 +28,12 @@ const politeModeInput  = document.getElementById("politeModeInput");
 const startFromInput   = document.getElementById("startFromInput");
 const stopAfterInput   = document.getElementById("stopAfterInput");
 const stopAfterRow     = document.getElementById("stopAfterRow");
+const verifyOptionsRow = document.getElementById("verifyOptionsRow");
+const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
+const preVerifyInput   = document.getElementById("preVerifyInput");
+const verifySection    = document.getElementById("verifySection");
+const verifyUrlNote    = document.getElementById("verifyUrlNote");
+const verifyDoneBtn    = document.getElementById("verifyDoneBtn");
 const concurrentSelect = document.getElementById("concurrentSelect");
 const statsGrid        = document.getElementById("statsGrid");
 const progressSection  = document.getElementById("progressSection");
@@ -104,7 +110,7 @@ window.addEventListener("load", () => {
   chrome.storage.local.get(["completedPmids", "completedCount", "downloadFolder"], data => {
     const pmids = data.completedPmids || [];
     if (pmids.length > 0) {
-      appendLog(`💾 Storage 紀錄：上次共完成 ${pmids.length} 篇，上傳進度 Excel 後將自動跳過`, "info");
+      appendLog(`💾 Storage 紀錄：上次共完成 ${pmids.length} 篇，開始下載時將自動跳過這些 PMID`, "info");
     }
     // 恢復上次的資料夾名稱
     if (data.downloadFolder && downloadFolderInput && data.downloadFolder !== "PubMed_PDFs") {
@@ -148,6 +154,7 @@ window.addEventListener("load", () => {
     }
     if (s.waitingLogin) showLoginSection();
     if (s.waitingCaptcha) showCaptchaSection(s.captchaImg);
+    if (s.verifyPending) showVerifySection(s.verifyPendingUrl);
     if (s.workers) updateWorkers(s.workers);
   });
 });
@@ -242,6 +249,13 @@ chrome.runtime.onMessage.addListener((msg) => {
     statusText.textContent = "✅ 登入成功，下載中...";
   }
   if (msg.action === "CAPTCHA_OK")   hideCaptchaSection();
+  if (msg.action === "VERIFY_REQUIRED") {
+    showVerifySection(msg.url, msg.preVerify);
+  }
+  if (msg.action === "VERIFY_OK") {
+    hideVerifySection();
+    statusText.textContent = "⚙ 下載中...";
+  }
   if (msg.action === "BOT_DETECTED") {
     appendLog(`⚠ [機器人偵測] ${msg.pmid} — ${msg.detail}`, "bot");
     statusText.textContent = "⚠ 偵測到機器人驗證！";
@@ -557,6 +571,9 @@ function showLoginSection(captchaImg, isRetry) {
     note.textContent = "";
   }
 
+  // 重試時（背景送出 retry:true）要把按鈕從「登入中...」恢復成可再次送出
+  loginSubmitBtn.textContent = isRetry ? "重新登入" : "登入 CMU 圖書館";
+  loginSubmitBtn.disabled    = false;
   loginUsername.focus();
   statusText.textContent = "🔐 需要登入 CMU 圖書館";
 }
@@ -585,6 +602,29 @@ function showCaptchaSection(imgBase64) {
 }
 function hideCaptchaSection() { captchaSection.classList.remove("show"); }
 
+// ── 人機驗證等待區 ──
+function showVerifySection(url, isPreVerify = false) {
+  if (!verifySection) return;
+  verifySection.style.display = "block";
+  if (verifyUrlNote) verifyUrlNote.textContent = url || "";
+  const titleEl = verifySection.querySelector("div");
+  if (titleEl) {
+    titleEl.textContent = isPreVerify
+      ? "🤖 驗證預熱中：若分頁出現人機驗證請先完成"
+      : "🤖 偵測到人機驗證，下載已暫停";
+  }
+  statusText.textContent = "🤖 等待人機驗證…";
+}
+function hideVerifySection() {
+  if (verifySection) verifySection.style.display = "none";
+}
+verifyDoneBtn?.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ action: "VERIFY_DONE" });
+  hideVerifySection();
+  statusText.textContent = "⚙ 下載中...";
+  appendLog("✅ 已回報人機驗證完成，繼續下載。", "ok");
+});
+
 // ══════════════════════════════════
 // Excel 解析
 // ══════════════════════════════════
@@ -594,7 +634,7 @@ function sanitizeFilename(title) {
     .replace(/[?/\\:*"<>|]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .substring(0, 200);
+    .substring(0, 120); // 過長標題會讓 Windows 完整路徑超過上限，導致 chrome.downloads 失敗
 }
 
 function sanitizeDownloadFolder(folder) {
@@ -621,7 +661,23 @@ function applyStartFrom(list, query) {
   return { list: list.slice(index), index, matched: list[index] };
 }
 
-function parseExcel(arrayBuffer, downloadAll, options = {}) {
+// 讀取目前選取的下載範圍："Y"（Column M = Y）| "all"（全部）| "retry"（僅「下次重試」）
+function getFilterMode() {
+  if (document.getElementById("filterRetry")?.checked) return "retry";
+  if (document.getElementById("filterAll")?.checked) return "all";
+  return "Y";
+}
+
+function filterModeText(mode) {
+  if (mode === "all") return "全部下載";
+  if (mode === "retry") return "僅「下次重試」";
+  return "Column M = Y";
+}
+
+function parseExcel(arrayBuffer, mode, options = {}) {
+  // 向下相容：舊呼叫傳 boolean（true=全部、false=Column M=Y）
+  if (mode === true) mode = "all";
+  else if (mode === false || !mode) mode = "Y";
   const recordInitial = options.recordInitial !== false;
   if (recordInitial) initialStatusMap = {};
   if (typeof XLSX === "undefined") throw new Error("SheetJS 未載入");
@@ -631,7 +687,8 @@ function parseExcel(arrayBuffer, downloadAll, options = {}) {
   // 找目標工作表
   let ws = wb.Sheets[SHEET_NAME];
   if (!ws) {
-    ws = wb.Sheets[wb.SheetNames[1]];
+    // 先退第 2 張（本專案檔案格式），只有一張工作表時退第 1 張
+    ws = wb.Sheets[wb.SheetNames[1]] || wb.Sheets[wb.SheetNames[0]];
     if (!ws) throw new Error(`找不到工作表「${SHEET_NAME}」`);
   }
 
@@ -651,8 +708,8 @@ function parseExcel(arrayBuffer, downloadAll, options = {}) {
     const row = rows[i];
     if (!row || row.every(v => v === null)) continue;
 
-    // 篩選邏輯
-    if (!downloadAll) {
+    // 篩選邏輯（retry 模式不看 Column M：能標到「下次重試」代表先前已是下載目標）
+    if (mode === "Y") {
       const include = String(row[COL_INCLUDE] || "").trim().toUpperCase();
       if (include !== "Y") continue;
     }
@@ -661,7 +718,9 @@ function parseExcel(arrayBuffer, downloadAll, options = {}) {
     const title   = row[COL_TITLE];
     if (!pmidRaw && !title) continue;
 
-    const pmid      = pmidRaw ? String(parseInt(String(pmidRaw), 10)) : null;
+    // parseInt 失敗會得到 NaN，直接轉字串會產生 pmid "NaN" 拿去組錯誤的 URL
+    const pmidNum   = pmidRaw != null ? parseInt(String(pmidRaw).trim(), 10) : NaN;
+    const pmid      = Number.isFinite(pmidNum) && pmidNum > 0 ? String(pmidNum) : null;
     const titleStr  = title ? String(title).trim() : "";
     const safeTitle = sanitizeFilename(titleStr);
 
@@ -674,6 +733,8 @@ function parseExcel(arrayBuffer, downloadAll, options = {}) {
       resultsMap[i + 1] = prevStatus;
       continue;
     }
+    // retry 模式：只收「下次重試」的列
+    if (mode === "retry" && prevStatus !== STATUS_RETRY) continue;
 
     found.push({
       rowIndex:  i + 1,
@@ -684,7 +745,7 @@ function parseExcel(arrayBuffer, downloadAll, options = {}) {
     });
   }
 
-  if (skippedCount > 0) {
+  if (skippedCount > 0 && recordInitial) {
     appendLog(`⏭ 已跳過 ${skippedCount} 篇（進度 Excel 標記為「下載成功」或「下載失敗」）`, "ok");
   }
 
@@ -692,187 +753,8 @@ function parseExcel(arrayBuffer, downloadAll, options = {}) {
 }
 
 // ══════════════════════════════════
-// 匯出結果 Excel
-// ══════════════════════════════════
-function exportResultExcel(rMap, originalFilename) {
-  if (!workbookData) return;
-  const wb = workbookData;
-  const sheetName = wb.SheetNames.includes(SHEET_NAME) ? SHEET_NAME : wb.SheetNames[1];
-  const ws        = wb.Sheets[sheetName];
-
-  // 找最後一欄（新增「自動下載狀態」）
-  const range  = XLSX.utils.decode_range(ws["!ref"] || "A1");
-  const newCol = range.e.c + 1;  // 緊接在最後一欄後
-
-  // 寫標題
-  const headerCell = XLSX.utils.encode_cell({ r: 0, c: newCol });
-  ws[headerCell] = { v: "自動下載狀態", t: "s" };
-
-  // 寫每列結果
-  for (const [rowIndex, status] of Object.entries(rMap)) {
-    const cellAddr = XLSX.utils.encode_cell({ r: parseInt(rowIndex) - 1, c: newCol });
-    ws[cellAddr] = { v: status, t: "s" };
-  }
-
-  // 更新 range
-  range.e.c = newCol;
-  ws["!ref"] = XLSX.utils.encode_range(range);
-
-  // 輸出
-  const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-  const blob  = new Blob([wbout], { type: "application/octet-stream" });
-  const url   = URL.createObjectURL(blob);
-  const base  = (originalFilename || "CANCER_PAPERS").replace(/\.xlsx$/i, "");
-  chrome.downloads.download({ url, filename: `${base}_自動處理結果.xlsx`, saveAs: true });
-}
-
-// ══════════════════════════════════
 // 上傳處理
 // ══════════════════════════════════
-// Excel 寫入鎖（防止並行 worker 同時觸發覆寫衝突）
-let excelWriting = false;
-let excelDebounceTimer = null;
-
-function scheduleExcelWrite(rMap) {
-  // debounce：最後一篇完成後 800ms 才寫，合併連續完成的多篇
-  if (excelDebounceTimer) clearTimeout(excelDebounceTimer);
-  excelDebounceTimer = setTimeout(() => {
-    excelDebounceTimer = null;
-    downloadProgressExcel(rMap, false);
-  }, 800);
-}
-
-function downloadProgressExcel(rMap = {}, saveAs = false) {
-  if (!cachedArrayBuffer) return;
-  if (!saveAs && excelWriting) return;
-
-  excelWriting = true;
-
-  const ExcelJS = window.ExcelJS;
-  if (!ExcelJS) { excelWriting = false; return; }
-
-  const workbook = new ExcelJS.Workbook();
-  workbook.xlsx.load(cachedArrayBuffer).then(() => {
-    const sheetName = workbook.worksheets.find(s => s.name === SHEET_NAME)
-      ? SHEET_NAME : workbook.worksheets[1]?.name;
-    const ws = workbook.getWorksheet(sheetName);
-    if (!ws) { excelWriting = false; return; }
-
-    // 找或建「下載狀況」欄
-    const headerRow = ws.getRow(1);
-    let statusCol = -1;
-    let failReasonCol = -1;
-    headerRow.eachCell((cell, colNum) => {
-      const v = String(cell.value || "").trim();
-      if (v === "下載狀況") statusCol = colNum;
-      if (v === "失敗訊息") failReasonCol = colNum;
-    });
-    if (statusCol < 0) {
-      statusCol = ws.columnCount + 1;
-      headerRow.getCell(statusCol).value = "下載狀況";
-      headerRow.getCell(statusCol).font = { bold: true };
-    }
-    if (failReasonCol < 0) {
-      failReasonCol = statusCol + 1;
-      // 確保不蓋到已有資料的欄
-      while (ws.getRow(1).getCell(failReasonCol).value &&
-             String(ws.getRow(1).getCell(failReasonCol).value).trim() !== "失敗訊息") {
-        failReasonCol++;
-      }
-      headerRow.getCell(failReasonCol).value = "失敗訊息";
-      headerRow.getCell(failReasonCol).font = { bold: true };
-    }
-
-    const YELLOW   = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } }; // 螢光黃：下載成功
-    const ORANGE   = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFA500" } }; // 橘色：下載失敗
-    // ExcelJS 的「無填色」必須用 pattern:'none'，type:'none' 是無效格式
-    const NO_FILL  = { type: "pattern", pattern: "none" };
-
-    function getFill(status, inSession) {
-      if (!inSession) return NO_FILL;
-      if (status === STATUS_FAIL) return ORANGE;
-      if (status === STATUS_RETRY) return { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
-      if (status === STATUS_SUCCESS) return YELLOW;
-      return NO_FILL;
-    }
-
-    // ── Step 1：只清除螢光黃（#FFFF00）的欄位，其他填色保留 ──
-    const YELLOW_ARGB = "FFFFFF00";
-    ws.eachRow((row, rowNumber) => {
-      if (rowNumber === 1) return; // 保留標題列
-      const cell = row.getCell(statusCol);
-      const argb = cell.fill?.fgColor?.argb || cell.fill?.bgColor?.argb || "";
-      if (argb.toUpperCase() === YELLOW_ARGB.toUpperCase()) {
-        cell.fill = NO_FILL;
-      }
-    });
-
-    // ── Step 2：寫入狀態值，本次 session 處理過的列填色 ──
-    // 成功 → 螢光黃；失敗 → 橘色；其他 → 無填色
-    const allItems = allParsedTargets.length ? allParsedTargets : targets;
-    for (const item of allItems) {
-      const status = rMap[item.rowIndex] || initialStatusMap[item.rowIndex] || item.status || STATUS_PENDING;
-      const row = ws.getRow(item.rowIndex);
-      const cell = row.getCell(statusCol);
-      cell.value = status;
-      cell.fill = getFill(status, sessionUpdatedRows.has(item.rowIndex));
-      // 失敗訊息欄
-      const failCell = row.getCell(failReasonCol);
-      if ((status === STATUS_FAIL || status === STATUS_RETRY) && resultsFailMap[item.rowIndex]) {
-        failCell.value = resultsFailMap[item.rowIndex];
-      } else if (status === STATUS_SUCCESS) {
-        failCell.value = null; // 成功就清空失敗訊息
-      }
-    }
-
-    // rMap 裡其他列（上次已成功跳過的）
-    for (const [rowIndex, status] of Object.entries(rMap || {})) {
-      const ri = parseInt(rowIndex, 10);
-      if (!allItems.find(it => it.rowIndex === ri)) {
-        const row = ws.getRow(ri);
-        const cell = row.getCell(statusCol);
-        cell.value = status || STATUS_FAIL;
-        cell.fill = getFill(status || STATUS_FAIL, sessionUpdatedRows.has(ri));
-        const failCell = row.getCell(failReasonCol);
-        if (((status || STATUS_FAIL) === STATUS_FAIL || (status || STATUS_FAIL) === STATUS_RETRY) && resultsFailMap[ri]) {
-          failCell.value = resultsFailMap[ri];
-        }
-      }
-    }
-
-    const base = (originalFilename || "CANCER_PAPERS")
-      .replace(/\.xlsx$/i, "")
-      .replace(/_下載進度管理$/i, "");
-    const folder = sanitizeDownloadFolder(downloadFolderInput?.value || getDefaultDownloadFolder());
-
-    workbook.xlsx.writeBuffer().then(buffer => {
-      const blob = new Blob([buffer], { type: "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-      chrome.downloads.download({
-        url,
-        filename: `${folder}/${base}_下載進度管理.xlsx`,
-        saveAs,
-        conflictAction: "overwrite",
-      }, () => {
-        excelWriting = false;
-        URL.revokeObjectURL(url);
-      });
-      setTimeout(() => { excelWriting = false; }, 10000);
-    }).catch(() => { excelWriting = false; });
-
-  }).catch(() => { excelWriting = false; });
-}
-
-
-function findOrCreateStatusColumn(ws, range) {
-  for (let c = range.s.c; c <= range.e.c; c++) {
-    const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
-    const value = String(cell?.v || cell?.w || "").trim();
-    if (value === "下載狀況") return c;
-  }
-  return range.e.c + 1;
-}
-
 function handleFile(file) {
   if (!file.name.endsWith(".xlsx")) { alert("請選擇 .xlsx 格式！"); return; }
   originalFilename = file.name;
@@ -883,9 +765,9 @@ function handleFile(file) {
       cachedArrayBuffer = e.target.result;
       resultsMap = {}; resultsFailMap = {};
       sessionUpdatedRows = new Set();
-      const downloadAll = document.getElementById("filterAll")?.checked || false;
-      document.getElementById("downloadAllCheck").value = downloadAll ? "1" : "0";
-      allParsedTargets = parseExcel(e.target.result, downloadAll);
+      const filterMode = getFilterMode();
+      document.getElementById("downloadAllCheck").value = filterMode === "all" ? "1" : "0";
+      allParsedTargets = parseExcel(e.target.result, filterMode);
       const startInfo = applyStartFrom(allParsedTargets, startFromInput?.value || "");
       targets = startInfo.list;
       if (startInfo.notFound) {
@@ -894,20 +776,26 @@ function handleFile(file) {
         appendLog(`↪ 從第 ${startInfo.index + 1} 筆目標開始: ${startInfo.matched.pmid || ""} ${startInfo.matched.title || ""}`, "info");
       }
 
-      // 計算 Y 篇數和全部篇數供顯示
+      // 計算各模式篇數供顯示
       try {
-        const allTargets = parseExcel(e.target.result, true, { recordInitial: false });
-        const yTargets   = parseExcel(e.target.result, false, { recordInitial: false });
-        document.getElementById("countY").textContent   = yTargets.length;
-        document.getElementById("countAll").textContent = allTargets.length;
+        const allTargets   = parseExcel(e.target.result, "all",   { recordInitial: false });
+        const yTargets     = parseExcel(e.target.result, "Y",     { recordInitial: false });
+        const retryTargets = parseExcel(e.target.result, "retry", { recordInitial: false });
+        document.getElementById("countY").textContent     = yTargets.length;
+        document.getElementById("countAll").textContent   = allTargets.length;
+        document.getElementById("countRetry").textContent = retryTargets.length;
+        if (retryTargets.length > 0) {
+          appendLog(`🔁 偵測到 ${retryTargets.length} 篇標記「下次重試」，可切換「僅「下次重試」」只跑這些。`, "info");
+        }
       } catch(e) {}
-      const modeText = downloadAll ? "全部論文" : "Column M = Y";
+      const modeText = filterModeText(filterMode);
       fileInfo.style.display = "block";
       fileInfo.textContent   = `📎 ${file.name}　|　找到 ${targets.length} 篇（${modeText}）`;
       settingsRow.style.display = "flex";
       if (folderRow) folderRow.style.display = "flex";
       if (batchRow) batchRow.style.display = "flex";
       if (politeModeRow) politeModeRow.style.display = "flex";
+      if (verifyOptionsRow) verifyOptionsRow.style.display = "flex";
       if (startFromRow) startFromRow.style.display = "flex";
       if (stopAfterRow) stopAfterRow.style.display = "flex";
       startBtn.disabled = targets.length === 0;
@@ -934,8 +822,13 @@ function handleFile(file) {
           baseName,
           folder,
         }
+      }, res => {
+        if (res?.ok) {
+          appendLog("📤 Excel 已同步至背景，將由背景自動維護進度檔。", "info");
+        } else {
+          appendLog(`❌ Excel 同步至背景失敗：${res?.error || "未知錯誤"}`, "fail");
+        }
       });
-      appendLog("📤 Excel 已同步至背景，將由背景自動維護進度檔。", "info");
     } catch(err) {
       appendLog(`❌ 解析失敗：${err.message}`, "fail");
     }
@@ -945,12 +838,12 @@ function handleFile(file) {
 
 function rebuildTargetsFromCache() {
   if (!cachedArrayBuffer) return;
-  const downloadAll = document.getElementById("filterAll")?.checked || false;
-  document.getElementById("downloadAllCheck").value = downloadAll ? "1" : "0";
-  allParsedTargets = parseExcel(cachedArrayBuffer, downloadAll);
+  const filterMode = getFilterMode();
+  document.getElementById("downloadAllCheck").value = filterMode === "all" ? "1" : "0";
+  allParsedTargets = parseExcel(cachedArrayBuffer, filterMode);
   const startInfo = applyStartFrom(allParsedTargets, startFromInput?.value || "");
   targets = startInfo.list;
-  const modeText = downloadAll ? "全部下載" : "Column M = Y";
+  const modeText = filterModeText(filterMode);
   fileInfo.textContent = `📎 ${originalFilename} | 找到 ${targets.length} 篇（${modeText}）`;
   startBtn.disabled = targets.length === 0;
   updateStats(targets.length, 0, 0, 0);
@@ -968,16 +861,16 @@ document.querySelectorAll("input[name='filterMode']").forEach(input => {
 // 開始
 startBtn.addEventListener("click", () => {
   if (cachedArrayBuffer) {
-    const downloadAll = document.getElementById("filterAll")?.checked || false;
-    document.getElementById("downloadAllCheck").value = downloadAll ? "1" : "0";
-    allParsedTargets = parseExcel(cachedArrayBuffer, downloadAll);
+    const filterMode = getFilterMode();
+    document.getElementById("downloadAllCheck").value = filterMode === "all" ? "1" : "0";
+    allParsedTargets = parseExcel(cachedArrayBuffer, filterMode);
     const startInfo = applyStartFrom(allParsedTargets, startFromInput?.value || "");
     targets = startInfo.list;
     if (startInfo.notFound) {
       alert("找不到指定的起始 PMID/title，請修正或留空。");
       return;
     }
-    const modeText = downloadAll ? "全部下載" : "Column M = Y";
+    const modeText = filterModeText(filterMode);
     fileInfo.textContent = `📎 ${originalFilename} | 找到 ${targets.length} 篇（${modeText}）`;
   }
   if (!targets.length) return;
@@ -1015,6 +908,8 @@ startBtn.addEventListener("click", () => {
     batchSize,
     politeMode,
     stopAfter,
+    manualVerifyPause: manualVerifyPauseInput?.checked !== false,
+    preVerifyElsevier: preVerifyInput?.checked === true,
   }, res => {
     if (!res?.ok) {
       appendLog(`❌ 啟動失敗：${res?.error}`, "fail");
@@ -1038,8 +933,7 @@ pauseBtn.addEventListener("click", () => {
   chrome.runtime.sendMessage({ action: "GET_STATE" }, res => {
     if (res?.state?.workers) updateWorkers(res.state.workers, true);
   });
-  // 暫停時取消 debounce，從 background 拿最新狀態立刻寫 Excel
-  if (excelDebounceTimer) { clearTimeout(excelDebounceTimer); excelDebounceTimer = null; }
+  // 從 background 拿最新狀態同步顯示（Excel 寫入由 background 負責）
   chrome.runtime.sendMessage({ action: "GET_RESULTS" }, res => {
     if (res?.resultsMap) resultsMap = res.resultsMap;
     if (res?.resultsFailMap) Object.assign(resultsFailMap, res.resultsFailMap);
@@ -1062,8 +956,7 @@ resumeBtn.addEventListener("click", () => {
 stopBtn.addEventListener("click", () => {
   if (!confirm("確定要結束本次任務？已完成的進度會保留。")) return;
   chrome.runtime.sendMessage({ action: "STOP_DOWNLOAD" });
-  // 結束時取消 debounce，從 background 拿最新狀態立刻寫 Excel
-  if (excelDebounceTimer) { clearTimeout(excelDebounceTimer); excelDebounceTimer = null; }
+  // 從 background 拿最新狀態同步顯示（Excel 寫入由 background 負責）
   chrome.runtime.sendMessage({ action: "GET_RESULTS" }, res => {
     if (res?.resultsMap) resultsMap = res.resultsMap;
     if (res?.resultsFailMap) Object.assign(resultsFailMap, res.resultsFailMap);
@@ -1106,6 +999,8 @@ clearBtn.addEventListener("click", () => {
   if (folderRow)        folderRow.style.display        = "none";
   if (batchRow)         batchRow.style.display         = "none";
   if (politeModeRow)    politeModeRow.style.display    = "none";
+  if (verifyOptionsRow) verifyOptionsRow.style.display = "none";
+  if (verifySection)    verifySection.style.display    = "none";
   if (startFromRow)     startFromRow.style.display     = "none";
   if (stopAfterRow)     stopAfterRow.style.display     = "none";
   if (resultDetailPanel) resultDetailPanel.style.display = "none";
@@ -1130,13 +1025,19 @@ clearBtn.addEventListener("click", () => {
   if (startFromInput) startFromInput.value = "";
   if (stopAfterInput) stopAfterInput.value = "0";
   if (politeModeInput) politeModeInput.checked = true;
+  if (manualVerifyPauseInput) manualVerifyPauseInput.checked = true;
+  if (preVerifyInput) preVerifyInput.checked = true;
   const filterY = document.getElementById("filterY");
   const filterAll = document.getElementById("filterAll");
+  const filterRetry = document.getElementById("filterRetry");
   if (filterY) filterY.checked = true;
   if (filterAll) filterAll.checked = false;
+  if (filterRetry) filterRetry.checked = false;
   document.getElementById("downloadAllCheck").value = "0";
   document.getElementById("countY").textContent = "-";
   document.getElementById("countAll").textContent = "-";
+  const countRetryEl = document.getElementById("countRetry");
+  if (countRetryEl) countRetryEl.textContent = "-";
   updateStats(0, 0, 0, 0);
   updateProgress(0, 0);
   statsGrid.style.display       = "none";
@@ -1147,8 +1048,6 @@ clearBtn.addEventListener("click", () => {
   pauseBtn.style.display  = "inline-block";
   resumeBtn.style.display = "none";
   isPaused = false;
-  excelWriting = false;
-  if (excelDebounceTimer) { clearTimeout(excelDebounceTimer); excelDebounceTimer = null; }
   statusText.textContent = "請上傳 Excel 檔案";
 });
 
@@ -1307,8 +1206,9 @@ function renderProgressTable() {
     const titleShort = item.title ? (item.title.length > 80 ? item.title.slice(0, 80) + "…" : item.title) : "（無標題）";
     const isFail = (status === STATUS_FAIL);
     const anchorId = rowAnchorMap[item.rowIndex] || "";
+    // MV3 CSP 禁止 inline onclick（會被靜默擋掉），改用 data-anchor + 事件委派
     const clickable = isFail && anchorId
-      ? `style="cursor:pointer;border-bottom:1px solid #f0f0f0;" onclick="jumpToWorkerLog('${anchorId}')" title="點擊查看 Worker Log"`
+      ? `data-anchor="${anchorId}" style="cursor:pointer;border-bottom:1px solid #f0f0f0;" title="點擊查看 Worker Log"`
       : `style="border-bottom:1px solid #f0f0f0;"`;
     return `<tr ${clickable}>
       <td style="padding:4px 8px;color:#555;font-family:Consolas,monospace;">${item.pmid || "-"}</td>
@@ -1349,6 +1249,12 @@ document.getElementById("progressTableClose2")?.addEventListener("click", () => 
 // 搜尋 / 篩選即時更新
 ptSearch?.addEventListener("input", renderProgressTable);
 ptFilter?.addEventListener("change", renderProgressTable);
+
+// 失敗列點擊 → 跳到對應 Worker log（inline onclick 會被擴充功能 CSP 擋掉，用事件委派）
+ptBody?.addEventListener("click", e => {
+  const tr = e.target.closest("tr[data-anchor]");
+  if (tr) jumpToWorkerLog(tr.dataset.anchor);
+});
 
 // 上傳 Excel 後顯示查看按鈕並初始化表格資料
 function showProgressTableBtn() {
