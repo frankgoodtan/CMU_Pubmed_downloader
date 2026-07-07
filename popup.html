@@ -351,16 +351,25 @@
     </label>
     <span class="delay-note">建議大量下載時開啟（限最多 2 篇並行、每篇 8-15 秒、每 25 篇休息 1-2 分鐘）</span>
   </div>
-  <div class="settings-row" id="verifyOptionsRow">
-    <label>人機驗證</label>
-    <label style="display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer;">
+  <!-- 驗證與 API 進階設定（收合式，不佔主介面） -->
+  <div class="settings-row" id="advancedRow">
+    <button type="button" id="advancedToggleBtn">⚙ 驗證與 API 進階設定</button>
+    <span class="delay-note" id="advancedSummary"></span>
+  </div>
+  <div id="advancedPanel" style="display:none; background:#f8fafc; border-bottom:1px solid #e2e8f0; padding:10px 14px;">
+    <div style="font-weight:700; font-size:12px; color:#334155; margin-bottom:6px;">🤖 人機驗證</div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; margin-bottom:4px;">
       <input type="checkbox" id="manualVerifyPauseInput" checked>
       <span>遇驗證時暫停等我通過</span>
     </label>
-    <label style="display:flex; align-items:center; gap:5px; font-size:12px; cursor:pointer;">
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
       <input type="checkbox" id="preVerifyInput" checked>
       <span>開始前用測試文章探測 ScienceDirect 驗證（不下載檔案）</span>
     </label>
+
+    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">🔑 出版商官方 API（有填就優先走 API 下載，不經出版社網頁、不會遇人機驗證）</div>
+    <!-- 各出版商憑證欄位由 api_settings.js 依 publisher_apis.js 的註冊表自動產生 -->
+    <div id="publisherApiFields"></div>
   </div>
   <div class="settings-row" id="startFromRow">
     <label>起始 PMID/title</label>
@@ -496,6 +505,8 @@
     <span class="shortcut-hint">Alt+S = 暫停/繼續</span>
   </div>
 
+  <script src="publisher_apis.js"></script>
+  <script src="api_settings.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

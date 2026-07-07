@@ -6,6 +6,12 @@ try {
 } catch(e) {
   console.warn("ExcelJS load failed:", e);
 }
+// 出版商官方 API（Elsevier 等）的註冊表與下載實作，獨立檔案方便維護
+try {
+  importScripts("publisher_apis.js");
+} catch(e) {
+  console.warn("publisher_apis load failed:", e);
+}
 
 let controlWindowId = null;
 
@@ -70,6 +76,26 @@ function stopKeepAlive() {
   if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
 }
 
+// ── 下載檔名登記表 ──
+// Chrome 已知行為（crbug.com/40706258）：只要「有任何 onDeterminingFilename 監聽器
+// 註冊著」，chrome.downloads.download() 的 filename 參數就會被忽略，落回預設檔名
+// （data: URL 會變成「下載」並存到下載根目錄）。LWW 中轉頁下載期間必須掛這種監聽器，
+// 若其他 worker 恰好在同一時間寫失敗筆記/進度 Excel/PDF，檔名就會被打掉。
+// 因此所有由我們發起的下載，呼叫前先在這裡登記「URL → 預定檔名」，
+// 監聽器對登記過的下載重新 suggest 同一個檔名，確保命名與路徑不受影響。
+const pendingDownloadFilenames = new Map();
+function registerPendingDownloadFilename(url, filename) {
+  if (!url || !filename) return;
+  pendingDownloadFilenames.set(url, filename);
+  // 下載一啟動 determining 就會發生，10 分鐘後清掉避免 Map 無限成長
+  setTimeout(() => pendingDownloadFilenames.delete(url), 600000);
+}
+function getPendingDownloadFilename(item) {
+  return pendingDownloadFilenames.get(item?.url) ||
+         pendingDownloadFilenames.get(item?.finalUrl) ||
+         null;
+}
+
 // ?? ?典??????
 let G = resetState();
 
@@ -118,6 +144,9 @@ function resetState() {
     // 人機驗證暫停機制：偵測到出版社驗證頁時暫停派發，開分頁讓使用者手動通過
     manualVerifyPause: true,
     preVerifyElsevier: false,
+    // 出版商官方 API 憑證（publisher_apis.js 的註冊表；例：{ elsevier: { apiKey, insttoken } }）
+    // 有設定的出版商，其論文優先走 API 下載
+    publisherApiCreds: {},
     verifyPending: false,
     verifyPendingUrl: "",
     verifyPendingTabId: null,
@@ -160,6 +189,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const base = (meta.baseName || "CANCER_PAPERS").replace(/_下載進度管理$/i, "");
         const folder = meta.folder || "PubMed_PDFs";
         const dataUrl = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + b64;
+        registerPendingDownloadFilename(dataUrl, `${folder}/${base}_下載進度管理.xlsx`);
         chrome.downloads.download({
           url: dataUrl,
           filename: `${folder}/${base}_下載進度管理.xlsx`,
@@ -199,6 +229,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         G.politeMode = msg.politeMode !== false;
         G.manualVerifyPause = msg.manualVerifyPause !== false;
         G.preVerifyElsevier = !!msg.preVerifyElsevier;
+        G.publisherApiCreds = msg.publisherApiCreds || {};
         G.total      = targets.length;
         G.queue      = targets.map((_, i) => i);
         G.running    = true;
@@ -368,6 +399,9 @@ function notifyWorkers() {
 async function startDownloadEngine() {
   startKeepAlive();
   addLog(`開始下載，共 ${G.total} 篇，並行數量 ${G.concurrent}${G.politeMode ? "，已啟用保守模式" : ""}`, "info");
+  if (publisherApiConfigured(G.publisherApiCreds)) {
+    addLog("已啟用出版商官方 API（" + publisherApiConfiguredLabels(G.publisherApiCreds).join("、") + "）：每篇先詢問 API，命中就直接下載（不經出版社網頁、不會遇人機驗證）。", "info");
+  }
 
   addLog("檢查 EZproxy 登入狀態...", "info");
   const checkTab = await chrome.tabs.create({ url: "about:blank", active: false });
@@ -494,13 +528,24 @@ async function runWorker(workerIdx) {
 
     let status = "失敗";
     try {
-      const result = await getPdfUrlWithFallback(tabId, item, workerIdx);
-      const pdfUrl      = normalizePdfUrlValue(result?.pdfUrl ?? result);
+      // 出版商官方 API（publisher_apis.js）：有設定憑證時先試 API 直接抓 PDF
+      //（不開出版社頁面、不會遇到人機驗證）；非該社刊物或無權限時回退瀏覽器流程
+      let apiDownloaded = false;
+      if (item.pmid && publisherApiConfigured(G.publisherApiCreds)) {
+        apiDownloaded = await tryPublisherApiDownload(item, itemFolder, workerIdx, itemTrace, G.publisherApiCreds);
+      }
+      const result = apiDownloaded ? null : await getPdfUrlWithFallback(tabId, item, workerIdx);
+      const pdfUrl      = apiDownloaded ? null : normalizePdfUrlValue(result?.pdfUrl ?? result);
       localLinks        = result?.fullTextLinks ?? [];
       const localReason = result?.failureReason ?? "";
       localLinkAttempts = result?.linkAttempts ?? [];
 
-      if (pdfUrl === "SKIP") {
+      if (apiDownloaded) {
+        itemExcelStatus = STATUS_SUCCESS;
+        status = "成功";
+        G.ok++;
+        workerLog(workerIdx, `  已透過出版商官方 API 下載：${item.safeTitle}.pdf`, "ok");
+      } else if (pdfUrl === "SKIP") {
         itemExcelStatus = "跳過";
         status = "未下載";
         failureReason = localReason || "此篇在找到可下載 PDF 前被略過。";
@@ -978,6 +1023,7 @@ async function _buildAndSaveExcel({ toDownload = false } = {}) {
 
   const progressFilename = folder + "/" + base + "_下載進度管理.xlsx";
   addThreadLog("_buildAndSaveExcel triggering download", { filename: progressFilename });
+  registerPendingDownloadFilename(dataUrl, progressFilename);
   chrome.downloads.download({
     url: dataUrl,
     filename: progressFilename,
@@ -3176,6 +3222,7 @@ function createFailureNote(item, status, folder, reason = "", fullTextLinks = []
   const url = "data:text/plain;charset=utf-8," + encodeURIComponent(body);
   return new Promise(resolve => {
     const filename = sanitizeDownloadFolder(folder) + "/下載失敗檔案/" + safeTitle + ".txt";
+    registerPendingDownloadFilename(url, filename);
     chrome.downloads.download({
       url,
       filename,
@@ -3585,12 +3632,20 @@ async function downloadViaPageTriggeredDownload(tabId, pageUrl, safeTitle, folde
 
   let adoptedId = null;
   const onDeterminingFilename = (item, suggest) => {
+    // 登記過的下載（別的 worker 用 API 發起的 PDF/失敗筆記/進度 Excel）：
+    // 只要本監聽器存在，Chrome 就會忽略 download() 的 filename（crbug 40706258），
+    // 必須在這裡重新 suggest 回原本登記的檔名，否則會變成「下載」掉在根目錄
+    const intended = getPendingDownloadFilename(item);
+    if (intended) {
+      suggest({ filename: intended, conflictAction: "overwrite" });
+      return;
+    }
     const src = [item.url, item.finalUrl, item.referrer].filter(Boolean).join(" ");
     if (adoptedId == null && /lww|wolterskluwer|downloadpdf/i.test(src)) {
       adoptedId = item.id;
       suggest({ filename: targetPath, conflictAction: "overwrite" });
     } else {
-      suggest(); // 其他下載（含別的 worker 用 API 發起的）維持原檔名
+      suggest(); // 其他未知來源的下載維持 Chrome 決定的檔名
     }
   };
 
@@ -3790,6 +3845,7 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
   }
 
   const downloadFolder = sanitizeDownloadFolder(folder);
+  registerPendingDownloadFilename(pdfUrl, downloadFolder + "/" + safeTitle + ".pdf");
   return await new Promise(resolve => {
     chrome.downloads.download({
       url:      pdfUrl,
@@ -3925,6 +3981,7 @@ function debuggerDetach(target) {
 function downloadBase64Pdf(base64, safeTitle, folder = "PubMed_PDFs", trace = null) {
   const rec = line => { if (Array.isArray(trace)) trace.push(traceStamp() + line); };
   const downloadFolder = sanitizeDownloadFolder(folder);
+  registerPendingDownloadFilename("data:application/pdf;base64," + base64, downloadFolder + "/" + safeTitle + ".pdf");
   return new Promise(resolve => {
     chrome.downloads.download({
       url: "data:application/pdf;base64," + base64,

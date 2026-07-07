@@ -28,7 +28,7 @@ const politeModeInput  = document.getElementById("politeModeInput");
 const startFromInput   = document.getElementById("startFromInput");
 const stopAfterInput   = document.getElementById("stopAfterInput");
 const stopAfterRow     = document.getElementById("stopAfterRow");
-const verifyOptionsRow = document.getElementById("verifyOptionsRow");
+// 進階設定面板（人機驗證選項＋出版商 API 憑證）的 UI 邏輯在 api_settings.js（AdvancedSettings）
 const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
 const preVerifyInput   = document.getElementById("preVerifyInput");
 const verifySection    = document.getElementById("verifySection");
@@ -90,6 +90,7 @@ function getDefaultDownloadFolder() {
 }
 
 if (downloadFolderInput) downloadFolderInput.value = getDefaultDownloadFolder();
+
 
 const STATUS_PENDING = "未下載";
 const STATUS_SUCCESS = "下載成功";
@@ -795,7 +796,7 @@ function handleFile(file) {
       if (folderRow) folderRow.style.display = "flex";
       if (batchRow) batchRow.style.display = "flex";
       if (politeModeRow) politeModeRow.style.display = "flex";
-      if (verifyOptionsRow) verifyOptionsRow.style.display = "flex";
+      AdvancedSettings.show();
       if (startFromRow) startFromRow.style.display = "flex";
       if (stopAfterRow) stopAfterRow.style.display = "flex";
       startBtn.disabled = targets.length === 0;
@@ -880,7 +881,7 @@ startBtn.addEventListener("click", () => {
   const downloadFolder = sanitizeDownloadFolder(downloadFolderInput?.value || getDefaultDownloadFolder());
   const batchSize   = Math.max(0, parseInt(batchSizeInput?.value || "0", 10) || 0);
   const stopAfter   = Math.max(0, parseInt(stopAfterInput?.value  || "0", 10) || 0);
-  // 記憶資料夾名稱，下次開啟自動帶入
+  // 記憶資料夾名稱（API 憑證由 api_settings.js 隨輸入即時儲存）
   chrome.storage.local.set({ downloadFolder });
   resultsMap = {}; resultsFailMap = {};
   sessionUpdatedRows = new Set();
@@ -910,6 +911,7 @@ startBtn.addEventListener("click", () => {
     stopAfter,
     manualVerifyPause: manualVerifyPauseInput?.checked !== false,
     preVerifyElsevier: preVerifyInput?.checked === true,
+    publisherApiCreds: AdvancedSettings.getCreds(),
   }, res => {
     if (!res?.ok) {
       appendLog(`❌ 啟動失敗：${res?.error}`, "fail");
@@ -999,7 +1001,7 @@ clearBtn.addEventListener("click", () => {
   if (folderRow)        folderRow.style.display        = "none";
   if (batchRow)         batchRow.style.display         = "none";
   if (politeModeRow)    politeModeRow.style.display    = "none";
-  if (verifyOptionsRow) verifyOptionsRow.style.display = "none";
+  AdvancedSettings.hide();
   if (verifySection)    verifySection.style.display    = "none";
   if (startFromRow)     startFromRow.style.display     = "none";
   if (stopAfterRow)     stopAfterRow.style.display     = "none";
