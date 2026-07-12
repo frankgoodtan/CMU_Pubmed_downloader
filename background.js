@@ -12,6 +12,20 @@ try {
 } catch(e) {
   console.warn("publisher_apis load failed:", e);
 }
+// Full Text 連結的平台判斷表與各平台 PDF 抓取邏輯，獨立資料夾方便維護
+// （見 platform_handlers/full_text_platforms.js 開頭的說明）
+try {
+  importScripts("platform_handlers/full_text_platforms.js");
+} catch(e) {
+  console.warn("full_text_platforms load failed:", e);
+}
+// 中文論文（Excel 語言欄=Chinese）查詢流程，獨立檔案方便維護
+// （見 platform_handlers/chinese_paper_search.js 開頭的說明）
+try {
+  importScripts("platform_handlers/chinese_paper_search.js");
+} catch(e) {
+  console.warn("chinese_paper_search load failed:", e);
+}
 
 let controlWindowId = null;
 
@@ -61,6 +75,15 @@ const STATUS_RETRY   = "下次重試";
 const PUBMED_FULL_TEXT_WAIT_MS = 60000;
 const WORKER_TAB_RECYCLE_EVERY = 15;
 
+// 彈性 worker 池：某篇處理太久時（反覆重試、等待逾時等，目前還不確定具體會是
+// 哪些狀況），讓該 worker 繼續把手上這篇處理完（完成後就結束，不再拿下一篇），
+// 同時另開一個新 worker 頂上、接手佇列，避免整體下載速度被單一篇卡住拖慢。
+// 為避免系統性問題（例如整段網路斷線，每篇都會卡住）觸發無限新開 worker，
+// 同時存在的 worker 總數（原本並行數 + 接手用的）有上限。
+const STALL_THRESHOLD_MS      = 40000;  // 單篇處理超過這個時間視為「卡住」
+const STALL_MAX_TOTAL_WORKERS = 10;     // 同時存在的 worker 總數上限
+const STALL_CHECK_INTERVAL_MS = 5000;   // 多久巡視一次是否有 worker 卡住
+
 // ── MV3 service worker keepalive ──
 // 長時間純等待（暫停、等使用者輸入帳密、保守模式休息 1-2 分鐘）期間沒有任何
 // chrome API 呼叫，SW 會因 30 秒閒置被 Chrome 終止，記憶體狀態 G 全部消失。
@@ -104,6 +127,7 @@ function resetState() {
     running:       false,
     paused:        false,
     stopped:       false,
+    testMode:      false,
     targets:       [],
     queue:         [],
     concurrent:    3,
@@ -124,6 +148,9 @@ function resetState() {
     stopAfter:            0,
     dispatched:           0,
     resultsFailMap:       {},
+    // 檔名重複保護：folder+檔名(小寫) → 已認領該檔名的項目清單（依 rowIndex 排序認領）
+    // 同一 rowIndex 重跑（重試/cookie 清理後重來）沿用原本認領到的檔名，不會再往後遞增
+    filenameClaims:       {},
     loginLock:      false,
     loginDone:      false,
     loginWaiters:   [],
@@ -135,6 +162,11 @@ function resetState() {
     tabPool:        [],
     domainLocks:    {},
     activeWorkers:  0,
+    // 彈性 worker 池狀態（見 STALL_* 常數說明）
+    nextWorkerIdx:      0,
+    liveWorkerPromises: new Set(),
+    workerRetireFlags:  new Set(),
+    stallCapWarned:     0,
     cookieCleanupRequested: false,
     cookieCleanupInProgress: false,
     cookieCleanupEvery: 10,
@@ -150,6 +182,7 @@ function resetState() {
     verifyPending: false,
     verifyPendingUrl: "",
     verifyPendingTabId: null,
+    verifyPreserveTab: false,
     verifyEpoch: 0,
     verifyRestartEpoch: 0,
   };
@@ -208,10 +241,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (G.running) { sendResponse({ ok: false, error: "已有下載任務執行中，請先停止或等待完成" }); return true; }
       chrome.storage.local.get(["completedPmids", "excelMeta"], data => {
         G = resetState();
-        // 依 Storage 完成紀錄跳過已成功下載的 PMID（可用「清除 Storage 完成紀錄」重置）
+        const testMode = !!msg.testMode;
+        // 依 Storage 完成紀錄跳過已成功下載的 PMID（可用「清除 Storage 完成紀錄」重置）；
+        // 測試下載模式（popup.js 的「🧪 測試下載」區塊）無條件強制下載指定文獻，不套用此跳過邏輯
         const doneSet = new Set((data.completedPmids || []).map(String));
         const rawTargets = msg.targets || [];
-        const targets = rawTargets.filter(t => !(t.pmid && doneSet.has(String(t.pmid))));
+        const targets = testMode ? rawTargets : rawTargets.filter(t => !(t.pmid && doneSet.has(String(t.pmid))));
         const skippedByStorage = rawTargets.length - targets.length;
 
         if (!targets.length) {
@@ -222,6 +257,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         G.targets    = targets;
+        G.testMode   = testMode;
         G.concurrent = msg.concurrent || 3;
         G.downloadFolder = sanitizeDownloadFolder(msg.downloadFolder || "PubMed_PDFs");
         G.batchSize  = Math.max(0, parseInt(msg.batchSize  || 0, 10) || 0);
@@ -246,6 +282,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (skippedByStorage > 0) {
           addLog(`⏭ 依 Storage 完成紀錄跳過 ${skippedByStorage} 篇已成功下載的論文`, "info");
         }
+        if (testMode) {
+          addLog(`🧪 測試下載模式：忽略下載狀況與 Storage 完成紀錄，強制下載指定的 ${targets.length} 篇：` +
+            targets.map(t => t.pmid || t.title).join("、"), "warn");
+        }
         startDownloadEngine();
       });
       return true;
@@ -258,6 +298,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case "RESUME_DOWNLOAD":
       G.paused = false;
+      // 暫停期間不算「卡住」，恢復時重置每個運作中 worker 的計時，
+      // 避免暫停太久一恢復就被誤判成卡住而立刻新開 worker
+      { const now = Date.now(); G.workers.forEach(w => { if (w && w.status === "running") w.startedAt = now; }); }
       sendResponse({ ok: true });
       return true;
 
@@ -337,7 +380,7 @@ function getPublicState() {
     captchaImg:    G.captchaImg,
     verifyPending: G.verifyPending,
     verifyPendingUrl: G.verifyPendingUrl,
-    workers:       G.workers.map(w => ({ label: w.label, status: w.status })),
+    workers:       G.workers.map(w => w ? { label: w.label, status: w.status } : { label: "", status: "idle" }),
   };
 }
 
@@ -385,11 +428,11 @@ function notifyProgress() {
 function notifyWorkers() {
   chrome.runtime.sendMessage({
     action: "WORKERS",
-    workers: G.workers.map(w => ({ label: w.label, status: w.status })),
+    workers: G.workers.map(w => w ? { label: w.label, status: w.status } : { label: "", status: "idle" }),
   }).catch(() => {});
 
   if (G.paused && !G.stopped && G.workers.length > 0) {
-    const allIdle = G.workers.every(w => w.status !== "running");
+    const allIdle = G.workers.every(w => !w || w.status !== "running");
     if (allIdle) {
       triggerExcelWrite({ toDownload: true });
     }
@@ -446,12 +489,22 @@ async function startDownloadEngine() {
 
   await buildTabPool(G.concurrent);
 
-  // ????worker
-  const workerPromises = [];
-  for (let i = 0; i < G.concurrent; i++) {
-    workerPromises.push(runWorker(i));
+  // 啟動 worker（含彈性 worker 池：卡住的 worker 會被接手，見 STALL_* 常數說明）
+  G.nextWorkerIdx = G.concurrent;
+  G.liveWorkerPromises = new Set();
+  G.workerRetireFlags  = new Set();
+  G.stallCapWarned     = 0;
+
+  for (let i = 0; i < G.concurrent; i++) launchWorker(i, { needsTab: false });
+
+  const stallTimer = setInterval(checkStalledWorkers, STALL_CHECK_INTERVAL_MS);
+  try {
+    while (G.liveWorkerPromises.size > 0) {
+      await Promise.race(G.liveWorkerPromises);
+    }
+  } finally {
+    clearInterval(stallTimer);
   }
-  await Promise.all(workerPromises);
 
   finishAll();
 }
@@ -465,6 +518,82 @@ async function buildTabPool(count) {
     G.tabPool.push(tab.id);
   }
   addLog(`已建立 ${count} 個背景分頁`, "info");
+}
+
+/**
+ * 啟動一個 worker 迴圈並掛進彈性 worker 池的存活追蹤集合。
+ * needsTab=true 用於中途接手用的新 worker（原本並行數以外的），會現開一個背景分頁；
+ * 一開始的 G.concurrent 個 worker 沿用 buildTabPool 已建好的分頁，不用再開。
+ */
+function launchWorker(workerIdx, { needsTab = false } = {}) {
+  let settleReserved;
+  const reserved = new Promise(res => { settleReserved = res; });
+  // 先同步把佔位 promise 加進存活集合，讓 checkStalledWorkers 的總數上限判斷
+  // 在分頁還沒建好前就已經把這個名額算進去，避免同一輪巡視內
+  // 連續判斷多個卡住的 worker 時，因為非同步建分頁的時間差而超過上限。
+  G.liveWorkerPromises.add(reserved);
+
+  (async () => {
+    try {
+      if (needsTab) {
+        const tab = await chrome.tabs.create({ url: "about:blank", active: false }).catch(() => null);
+        if (!tab) {
+          addThreadLog("Overflow worker tab creation failed; skip spawn", { workerIdx });
+          return;
+        }
+        G.tabPool[workerIdx] = tab.id;
+      }
+      G.workers[workerIdx] = { tabId: G.tabPool[workerIdx] || null, pmid: null, label: "等待中", status: "idle" };
+      notifyWorkers();
+      await runWorker(workerIdx);
+    } catch(e) {
+      addThreadLog("Worker crashed", { workerIdx, message: e?.message || String(e) });
+    } finally {
+      G.liveWorkerPromises.delete(reserved);
+      settleReserved();
+    }
+  })();
+
+  return reserved;
+}
+
+/**
+ * 巡視所有運作中的 worker，找出處理單篇已超過 STALL_THRESHOLD_MS 的，
+ * 標記它「完成這篇後就結束」，並另開一個新 worker 頂上接手佇列，
+ * 讓整體並行數盡量維持在原本設定的數量。總 worker 數有上限，
+ * 避免系統性問題（例如網路整段斷線，每篇都卡住）觸發無限新開 worker。
+ */
+function checkStalledWorkers() {
+  if (!G.running || G.stopped || G.paused) return;
+  if (!G.queue || G.queue.length === 0) return;
+
+  const maxTotal = Math.max(G.concurrent || 1, STALL_MAX_TOTAL_WORKERS);
+  const now = Date.now();
+
+  for (let idx = 0; idx < G.workers.length; idx++) {
+    if (G.queue.length === 0) break;
+    const w = G.workers[idx];
+    if (!w || w.status !== "running" || !w.startedAt) continue;
+    if (G.workerRetireFlags.has(idx)) continue;
+    if (now - w.startedAt < STALL_THRESHOLD_MS) continue;
+
+    if (G.liveWorkerPromises.size >= maxTotal) {
+      if (!G.stallCapWarned || now - G.stallCapWarned > 60000) {
+        addLog(`⚠ 偵測到 worker 處理過久（PMID:${w.pmid || "?"}），但目前 worker 總數已達上限（${maxTotal}），暫不新開，避免無限增生（例如整體網路異常導致每篇都卡住）。`, "warn");
+        G.stallCapWarned = now;
+      }
+      break;
+    }
+
+    G.workerRetireFlags.add(idx);
+    const elapsedSec = Math.round((now - w.startedAt) / 1000);
+    workerLog(idx, `  本篇已處理超過 ${elapsedSec} 秒，另開一個新 worker 接手後續佇列；此 worker 會繼續處理完這篇後才結束（不再拿下一篇）。`, "warn");
+    addThreadLog("Worker stalled beyond threshold; spawning replacement worker", {
+      workerIdx: idx, pmid: w.pmid, elapsedMs: now - w.startedAt, thresholdMs: STALL_THRESHOLD_MS,
+      liveWorkers: G.liveWorkerPromises.size, maxTotal
+    });
+    launchWorker(G.nextWorkerIdx++, { needsTab: true });
+  }
 }
 
 async function recycleWorkerTab(workerIdx, oldTabId, reason = "") {
@@ -488,6 +617,11 @@ async function runWorker(workerIdx) {
     while (G.paused && !G.stopped) await sleep(500);
     if (G.stopped) break;
 
+    if (G.workerRetireFlags && G.workerRetireFlags.has(workerIdx)) {
+      workerLog(workerIdx, "  已有其他 worker 接手佇列，此 worker 到此結束。", "info");
+      break;
+    }
+
     while (G.cookieCleanupRequested && !G.stopped) await waitForCookieCleanup(workerIdx);
     if (G.stopped) break;
 
@@ -503,21 +637,32 @@ async function runWorker(workerIdx) {
     if (!item) continue;
     G.activeWorkers = (G.activeWorkers || 0) + 1;
     const itemFolder = getBatchFolderForIndex(idx);
+    // 檔名重複保護：本篇實際要存的檔名（撞名時會是「標題 (2)」之類）
+    const filenameClaim = claimDownloadFilename(item, itemFolder, ".pdf");
+    const downloadName = filenameClaim.finalName;
+    const downloadItem = filenameClaim.duplicate ? { ...item, safeTitle: downloadName } : item;
     if (processedSinceRecycle >= WORKER_TAB_RECYCLE_EVERY) {
       tabId = await recycleWorkerTab(workerIdx, tabId, `已處理 ${processedSinceRecycle} 篇`);
       processedSinceRecycle = 0;
     }
 
-    G.workers[workerIdx] = { tabId, pmid: item.pmid, label: truncate(item.title, 40), status: "running" };
+    G.workers[workerIdx] = { tabId, pmid: item.pmid, label: truncate(item.title, 40), status: "running", startedAt: Date.now() };
     notifyWorkers();
 
  
     const anchorId = `w${workerIdx}-pmid-${item.pmid}`;
     workerLog(workerIdx, `\n[Worker ${workerIdx+1}] PMID:${item.pmid} | ${truncate(item.title, 55)}`, "info", anchorId);
+    if (filenameClaim.duplicate) {
+      workerLog(workerIdx, `  ⚠ 清理後檔名與其他篇重複，本篇改存為「${downloadName}.pdf」，避免互相覆蓋，請稍後核對。`, "warn");
+      addThreadLog("Duplicate filename detected; using suffixed name", {
+        rowIndex: item.rowIndex, pmid: item.pmid, baseTitle: item.safeTitle, finalName: downloadName
+      });
+    }
     let itemExcelStatus = STATUS_FAIL;
     let failureReason = "";
     let localLinks = [];
     let localLinkAttempts = [];
+    let localReport = null;
     let pdfDownloadAttempts = [];
     G.lastPdfFailureReason = "";
     // 本篇的細部處理過程紀錄；失敗時會附到 下載失敗檔案/*.txt 末尾，方便回頭 debug
@@ -532,19 +677,21 @@ async function runWorker(workerIdx) {
       //（不開出版社頁面、不會遇到人機驗證）；非該社刊物或無權限時回退瀏覽器流程
       let apiDownloaded = false;
       if (item.pmid && publisherApiConfigured(G.publisherApiCreds)) {
-        apiDownloaded = await tryPublisherApiDownload(item, itemFolder, workerIdx, itemTrace, G.publisherApiCreds);
+        apiDownloaded = await tryPublisherApiDownload(downloadItem, itemFolder, workerIdx, itemTrace, G.publisherApiCreds);
       }
-      const result = apiDownloaded ? null : await getPdfUrlWithFallback(tabId, item, workerIdx);
+      const result = apiDownloaded ? null : await getPdfUrlWithFallback(tabId, item, workerIdx, itemTrace, downloadName, itemFolder);
       const pdfUrl      = apiDownloaded ? null : normalizePdfUrlValue(result?.pdfUrl ?? result);
       localLinks        = result?.fullTextLinks ?? [];
       const localReason = result?.failureReason ?? "";
       localLinkAttempts = result?.linkAttempts ?? [];
+      localReport       = result?.report ?? null;
 
-      if (apiDownloaded) {
+      if (apiDownloaded || result?.alreadyDownloaded) {
         itemExcelStatus = STATUS_SUCCESS;
         status = "成功";
         G.ok++;
-        workerLog(workerIdx, `  已透過出版商官方 API 下載：${item.safeTitle}.pdf`, "ok");
+        const successVia = apiDownloaded ? "出版商官方 API" : "中文論文查詢流程（CNKI）";
+        workerLog(workerIdx, `  已透過${successVia}下載：${downloadName}.pdf`, "ok");
       } else if (pdfUrl === "SKIP") {
         itemExcelStatus = "跳過";
         status = "未下載";
@@ -583,9 +730,9 @@ async function runWorker(workerIdx) {
           itemTrace.push("   " + (candidate.printPmc ? (candidate.printUrl || candidate.sourceUrl || candidate.pdfUrl) : candidate.pdfUrl));
           try {
             if (candidate.printPmc) {
-              ok = await printPmcPageToPdf(tabId, candidate.printUrl || candidate.sourceUrl, item.safeTitle, itemFolder, itemTrace);
+              ok = await printPmcPageToPdf(tabId, candidate.printUrl || candidate.sourceUrl, downloadName, itemFolder, itemTrace);
             } else {
-              ok = await triggerDownload(candidate.pdfUrl, item.safeTitle, itemFolder, tabId, itemTrace);
+              ok = await triggerDownload(candidate.pdfUrl, downloadName, itemFolder, tabId, itemTrace);
             }
           } finally {
             releaseDomainLock(downloadLockKey, workerIdx);
@@ -618,7 +765,7 @@ async function runWorker(workerIdx) {
           itemExcelStatus = STATUS_SUCCESS;
           status = "成功";
           G.ok++;
-          workerLog(workerIdx, `  下載成功：${item.safeTitle}.pdf`, "ok");
+          workerLog(workerIdx, `  下載成功：${downloadName}.pdf`, "ok");
         } else {
           const attemptsDetail = (result?.linkAttempts?.length)
             ? `\n連結嘗試紀錄：${result.linkAttempts.join(" | ")}`
@@ -738,13 +885,18 @@ async function runWorker(workerIdx) {
       continue;
     }
 
+    // 撞名且最終成功：把提醒寫進「失敗原因」欄（Excel 匯出時該欄對成功列也會保留此註記），
+    // 提醒使用者這篇的檔名被改過，需核對是否對應正確
+    if (filenameClaim.duplicate && itemExcelStatus === STATUS_SUCCESS && !failureReason) {
+      failureReason = `⚠ 檔名重複：清理後標題與其他篇相同，本篇已存為「${downloadName}.pdf」（而非「${item.safeTitle}.pdf」）以避免覆蓋，請核對此列對應的 PDF 是否正確。`;
+    }
+
     G.resultsMap[item.rowIndex] = itemExcelStatus;
     if (itemExcelStatus !== STATUS_SUCCESS) {
-      const noteAttempts = [
-        ...localLinkAttempts,
-        ...pdfDownloadAttempts
-      ];
-      const noteOk = await createFailureNote(item, itemExcelStatus, itemFolder, failureReason, localLinks, noteAttempts, itemTrace);
+      const noteOk = await createFailureNote(
+        item, itemExcelStatus, itemFolder, failureReason,
+        localLinks, localLinkAttempts, pdfDownloadAttempts, itemTrace, localReport
+      );
       if (!noteOk) {
         workerLog(workerIdx, "  下載失敗 txt 產生失敗，請查看 thread log。", "fail");
       }
@@ -983,7 +1135,8 @@ async function _buildAndSaveExcel({ toDownload = false } = {}) {
     if ((status === STATUS_FAIL || status === STATUS_RETRY) && failMap[ri]) {
       failCell.value = failMap[ri];
     } else if (status === STATUS_SUCCESS) {
-      failCell.value = null;
+      // 成功列一般清空此欄；但若是「檔名重複」提醒（見 filenameClaim 邏輯），要保留下來
+      failCell.value = failMap[ri] || null;
     }
   }
 
@@ -1040,12 +1193,66 @@ async function _buildAndSaveExcel({ toDownload = false } = {}) {
   });
 }
 
-async function getPdfUrlWithFallback(tabId, item, workerIdx) {
+// 一個 stage 結果：{ ok: true/false, detail: "說明文字" }。ok 為 undefined 代表這個
+// 階段根本沒跑到（被前面某個失敗擋住），createFailureNote 會顯示成「未執行」。
+function stageResult(ok, detail = "") {
+  return { ok, detail };
+}
+
+async function getPdfUrlWithFallback(tabId, item, workerIdx, trace = null, downloadName = null, itemFolder = null) {
   let localFailureReason = "";
   let localFullTextLinks = [];
+  // 提早宣告：中文論文查詢流程（若有嘗試）的紀錄要留在這裡，不管後面從哪個
+  // return 點離開，都會帶著這筆紀錄一起回去，最後才不會在下載失敗 txt 裡消失。
+  const linkAttempts = [];
+
+  // 分段除錯報告：下載失敗 txt 會依這個結構分段列出「中文查詢流程」與「PubMed 流程」
+  // 各階段是成功/失敗，取代舊版一大段不好讀的自由文字。見 createFailureNote()。
+  const report = {
+    isChineseTitle: isBracketedChineseTitle(item),
+    chinese: null,
+    pubmed: {
+      entered: null,        // stageResult：是否成功導到 PubMed 網址
+      articleFound: null,   // stageResult：是否確認為有效文章頁
+      fullTextLinks: null,  // { ...stageResult, list: [{label,url}] }
+      linkAttempts: [],     // [{ label, url, pdfFound: stageResult }]
+    },
+  };
 
   if (await isLoginPage(tabId)) {
     await ensureLogin(tabId);
+  }
+
+  // 中文期刊（PubMed Title 整段被「[ ]」框住）：PubMed 上常找不到可用的 Full Text
+  // link，先試中文論文查詢流程（見 platform_handlers/chinese_paper_search.js）；
+  // 失敗才落回下面原本的 PubMed PMID/title 流程，不影響非中文論文的行為。
+  if (report.isChineseTitle) {
+    workerLog(workerIdx, "  Title 被中括號框住，判定為中文期刊，先嘗試中文論文查詢流程。", "info");
+    addThreadLog("Chinese paper search flow starting", { pmid: item.pmid, title: item.title, doi: item.doi });
+    // 搜尋＋下載（含點文章頁、點下載按鈕、攔截檔案）整段都在
+    // searchChinesePaperPdf 裡完成，這裡只需要看 downloaded 這個布林結果。
+    const cnResult = await searchChinesePaperPdf(tabId, item, workerIdx, trace, downloadName, itemFolder);
+    report.chinese = cnResult?.report || { otherReason: "中文論文查詢流程未回傳分段報告（非預期狀況）。" };
+    if (cnResult?.downloaded) {
+      workerLog(workerIdx, "  中文論文查詢流程下載成功，不需再嘗試 PubMed 流程。", "ok");
+      addThreadLog("Chinese paper search flow succeeded", { pmid: item.pmid, articleUrl: cnResult.pdfUrl });
+      return {
+        pdfUrl: cnResult.pdfUrl,
+        alreadyDownloaded: true,
+        failureReason: "",
+        fullTextLinks: [],
+        linkAttempts: [ "中文論文查詢流程（CNKI）：已下載成功 " + cnResult.pdfUrl ],
+        report,
+      };
+    }
+    const cnReason = cnResult?.failureReason || "未知原因（流程未回傳失敗說明）";
+    workerLog(workerIdx, "  中文論文查詢流程未取得 PDF：" + cnReason + "；改用原本 PubMed 流程。", "warn");
+    addThreadLog("Chinese paper search flow failed; falling back to PubMed flow", {
+      pmid: item.pmid, reason: cnReason
+    });
+    // 留一筆紀錄：就算後面 PubMed 流程也失敗，下載失敗 txt 裡才看得到 CNKI 那次
+    // 到底發生了什麼事，而不是只看到「PubMed 沒有 Full Text 連結」這種沒有幫助的說明。
+    linkAttempts.push("中文論文查詢流程（CNKI）：" + cnReason);
   }
 
   let pubmedUrl = null;
@@ -1069,14 +1276,19 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
     }
   }
 
-  if (!pubmedUrl) return { pdfUrl: "SKIP", failureReason: "", fullTextLinks: [] };
+  if (!pubmedUrl) {
+    report.pubmed.entered = stageResult(false, "沒有可用的 PMID 或 Title，無法組出 PubMed 網址。");
+    return { pdfUrl: "SKIP", failureReason: "", fullTextLinks: [], linkAttempts, report };
+  }
 
   await navigateTab(tabId, pubmedUrl, 4000);
+  report.pubmed.entered = stageResult(true, "已導到：" + pubmedUrl);
 
   if (await isLoginPage(tabId)) {
     workerLog(workerIdx, "  PubMed 頁面要求重新登入，登入後重試。", "warn");
     await ensureLogin(tabId);
     await navigateTab(tabId, pubmedUrl, 4000);
+    report.pubmed.entered = stageResult(true, "已導到：" + pubmedUrl + "（過程中重新登入過一次）");
   }
 
   // PMID 頁面無效（Excel 內 PMID 可能有誤）時，退回 title 搜尋一次
@@ -1096,25 +1308,43 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
 
   const pageState = await checkPageState(tabId);
   if (pageState === "bot") {
+    report.pubmed.articleFound = stageResult(false, "偵測到機器人/驗證頁，無法確認文章頁。");
     chrome.runtime.sendMessage({
       action: "BOT_DETECTED", pmid: item.pmid,
       detail: "Bot/captcha/access challenge detected"
     }).catch(() => {});
-    return { pdfUrl: "BOT", failureReason: "", fullTextLinks: [] };
+    return { pdfUrl: "BOT", failureReason: "", fullTextLinks: [], linkAttempts, report };
   }
+
+  const articleOk = await isPubmedArticlePage(tabId);
+  report.pubmed.articleFound = stageResult(
+    articleOk,
+    articleOk ? "已確認為有效的 PubMed 文章頁：" + pubmedUrl
+              : "PubMed 頁面看起來不是有效的文章頁（PMID 或 Title 可能有誤）：" + pubmedUrl
+  );
 
   const fullTextLinks = await waitForPubMedFullTextLinks(tabId, pubmedUrl, workerIdx);
   localFullTextLinks = fullTextLinks || [];
   if (!fullTextLinks?.length) {
     localFailureReason = "PubMed 頁面在等待與重載後仍未載入 Full Text 連結。";
-    return { pdfUrl: null, failureReason: localFailureReason, fullTextLinks: localFullTextLinks };
+    report.pubmed.fullTextLinks = stageResult(false, "無可用的 Full Text 連結。");
+    report.pubmed.fullTextLinks.list = [];
+    return { pdfUrl: null, failureReason: localFailureReason, fullTextLinks: localFullTextLinks, linkAttempts, report };
   }
+  report.pubmed.fullTextLinks = stageResult(
+    true,
+    "共找到 " + fullTextLinks.length + " 個 Full Text 連結。"
+  );
+  report.pubmed.fullTextLinks.list = fullTextLinks.map(ft => ({
+    label: ft.label || ft.source || "未知來源",
+    url: ft.url
+  }));
 
   const nonCmuLinks = fullTextLinks.filter(ft => !isCmuLibFullTextLink(ft));
   const cmuLinks = fullTextLinks.filter(isCmuLibFullTextLink);
   if (!nonCmuLinks.length && cmuLinks.length) {
     localFailureReason = "只找到 CMULib / SerialsSolutions Full Text link，無法直接解析 PDF。";
-    return { pdfUrl: null, failureReason: localFailureReason, fullTextLinks: localFullTextLinks, retryable: false, finalFailure: true };
+    return { pdfUrl: null, failureReason: localFailureReason, fullTextLinks: localFullTextLinks, retryable: false, finalFailure: true, linkAttempts, report };
   }
 
   if (fullTextLinks.length === 1 && fullTextLinks[0].source === "serialssolutions") {
@@ -1122,7 +1352,6 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
   }
 
   workerLog(workerIdx, "  找到 " + fullTextLinks.length + " 個 Full Text 連結，會依序嘗試。", "info");
-  const linkAttempts = [];
   const pdfCandidates = [];
 
   for (let i = 0; i < fullTextLinks.length; i++) {
@@ -1132,6 +1361,10 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
     const ftLabel = ft.label || ft.source || "未知來源";
     if (isCmuLibFullTextLink(ft)) {
       linkAttempts.push(ftLabel + ": CMULib / SerialsSolutions resolver 視為不可用，略過不嘗試。");
+      report.pubmed.linkAttempts.push({
+        label: ftLabel, url: ftUrl,
+        pdfFound: stageResult(false, "CMULib / SerialsSolutions resolver 視為不可用，略過不嘗試。")
+      });
       workerLog(workerIdx, "  略過 CMU Library / SerialsSolutions 連結。", "warn");
       continue;
     }
@@ -1176,6 +1409,10 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
         pdfUrl,
         printPmc: isPmcPrintCandidate(pdfUrl)
       });
+      report.pubmed.linkAttempts.push({
+        label: ftLabel, url: ftUrl,
+        pdfFound: stageResult(true, (isPmcPrintCandidate(pdfUrl) ? "PMC 無原生 PDF，改列印成 PDF：" : "找到 PDF：") + pdfUrl)
+      });
       continue;
     }
 
@@ -1188,6 +1425,7 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
       reason += " Atypon 註記：此平台常見只有 HTML 閱讀頁，沒有可直接下載的 PDF 端點。";
     }
     linkAttempts.push(ftLabel + ": " + reason);
+    report.pubmed.linkAttempts.push({ label: ftLabel, url: ftUrl, pdfFound: stageResult(false, reason) });
     workerLog(workerIdx, "  這個 Full Text 連結沒有取得 PDF，改試下一個。", "warn");
     addThreadLog("No PDF from Full Text link", {
       workerIdx,
@@ -1204,6 +1442,7 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
       failureReason: "",
       fullTextLinks: localFullTextLinks,
       linkAttempts,
+      report,
     };
   }
 
@@ -1213,12 +1452,66 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx) {
       ? "已嘗試非 CMULib 與 CMULib Full Text link，但都沒有取得 PDF：" + tried
       : "已嘗試所有 Full Text link，但都沒有取得 PDF：" + tried;
   }
-  return { pdfUrl: null, failureReason: localFailureReason, fullTextLinks: localFullTextLinks, linkAttempts };
+  return { pdfUrl: null, failureReason: localFailureReason, fullTextLinks: localFullTextLinks, linkAttempts, report };
+}
+
+// 偵測「文章內容區的 DOM 是否已經穩定不再變動」：連續 quietMs 毫秒沒有任何
+// mutation 就視為穩定。PubMed 的 Full Text links 是頁面載入後另外發一支 AJAX
+// （articleLinksAjaxUrl）才把連結填進 DOM，單純輪詢一段固定時間後放棄，無法分辨
+// 「這篇真的沒有連結」跟「AJAX 還沒回來」。用 MutationObserver 直接觀察內容區：
+// 觀察範圍只鎖定文章內容區（不含 header/footer），避開背景分析/追蹤 script
+// 對 body 其他角落的持續性 DOM 異動，才不會一直被重置安靜計時器。
+// 回傳 "settled"＝已確認穩定；"timeout"＝時限內仍在變動，無法確定，交給呼叫端走原本的輪詢/重試。
+async function waitForArticleDomSettle(tabId, quietMs = 2500, maxMs = 15000) {
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (quiet, maxWait) => new Promise(resolve => {
+        const root = document.querySelector("main#article-details, main.article-details, #full-view-heading") || document.body;
+        let settled = false;
+        let quietTimer = null;
+        let hardCap = null;
+        const finish = reason => {
+          if (settled) return;
+          settled = true;
+          try { observer.disconnect(); } catch {}
+          if (quietTimer) clearTimeout(quietTimer);
+          if (hardCap) clearTimeout(hardCap);
+          resolve(reason);
+        };
+        const resetQuietTimer = () => {
+          if (quietTimer) clearTimeout(quietTimer);
+          quietTimer = setTimeout(() => finish("settled"), quiet);
+        };
+        const observer = new MutationObserver(resetQuietTimer);
+        observer.observe(root, { childList: true, subtree: true, attributes: true });
+        hardCap = setTimeout(() => finish("timeout"), maxWait);
+        resetQuietTimer();
+      }),
+      args: [quietMs, maxMs]
+    });
+    return r?.[0]?.result || "timeout";
+  } catch {
+    return "timeout";
+  }
 }
 
 async function waitForPubMedFullTextLinks(tabId, pubmedUrl, workerIdx) {
   workerLog(workerIdx, "  等待 PubMed Full Text link 載入...", "info");
-  let links = await pollForFullTextLink(tabId, PUBMED_FULL_TEXT_WAIT_MS);
+
+  // 先確認文章內容區的 DOM 是否已經穩定：若穩定下來仍然沒有 Full Text 連結，
+  // 代表頁面（含它自己載入全文連結用的 AJAX）已經跑完，這篇是真的沒有全文連結，
+  // 不必再乾等固定的 60 秒＊2；DOM 仍在變動（未在時限內穩定）才落回原本的長輪詢。
+  const settleResult = await waitForArticleDomSettle(tabId, 2500, 15000);
+  let links = await pollForFullTextLink(tabId, 600); // 立即檢查一次目前 DOM 狀態
+  if (links?.length) return links;
+  if (settleResult === "settled") {
+    workerLog(workerIdx, "  頁面內容已穩定且無 Full Text 連結，判定此篇真的沒有全文連結（非逾時判定）。", "info");
+    addThreadLog("Article DOM settled with no full text links; treating as confirmed empty", { workerIdx, pubmedUrl });
+    return [];
+  }
+
+  links = await pollForFullTextLink(tabId, PUBMED_FULL_TEXT_WAIT_MS);
   if (links?.length) return links;
 
   workerLog(workerIdx, "  PubMed Full Text link 尚未出現，重新載入 PubMed 頁面後再等待一次。", "warn");
@@ -1258,37 +1551,6 @@ async function getPubMedLoadState(tabId) {
   } catch (e) {
     return { error: e?.message || String(e) };
   }
-}
-
-function isCmuLibFullTextLink(ft) {
-  const url = String(ft?.url || "").toLowerCase();
-  const label = ((ft?.label || "") + " " + (ft?.source || "")).toLowerCase();
-  return ft?.source === "serialssolutions" ||
-         url.includes("serialssolutions") ||
-         url.includes("ss_uidtype") ||
-         label.includes("cmulib") ||
-         label.includes("china medical university library");
-}
-
-function isAtyponContext(entry) {
-  const text = [
-    entry?.source || "",
-    entry?.label || "",
-    entry?.sourceUrl || "",
-    entry?.url || "",
-    entry?.href || "",
-    entry?.pdfUrl || "",
-    typeof entry === "string" ? entry : ""
-  ].join(" ").toLowerCase();
-  return text.includes("atypon") ||
-         text.includes("journals-sagepub") ||
-         text.includes("sagepub") ||
-         text.includes("liebertpub") ||
-         text.includes("journals.lww");
-}
-
-function hasAtyponContext(pdfCandidates = [], fullTextLinks = [], linkAttempts = []) {
-  return [...(pdfCandidates || []), ...(fullTextLinks || []), ...(linkAttempts || [])].some(isAtyponContext);
 }
 
 function getPublisherLockKey(urlOrHost = "", label = "") {
@@ -1385,120 +1647,33 @@ async function getCurrentPageFailureReason(tabId) {
       }
     });
     return r?.[0]?.result || "";
-  } catch {
-    return "";
+  } catch (e) {
+    // 無法對這個分頁執行腳本，通常代表分頁正顯示 Chrome 自己的網路層錯誤頁
+    //（chrome-error://，例如跳轉太多次 ERR_TOO_MANY_REDIRECTS、連線逾時
+    // ERR_CONNECTION_TIMED_OUT、DNS 解析失敗等），而不是出版商網站真的回應了
+    // 什麼內容——以前這種情況只會回傳空字串，呼叫端會退回成完全沒有資訊量的
+    // 「進入 Full Text link 後未找到 PDF 下載連結」，這裡改成盡量說明清楚。
+    return await describeUnscriptablePage(tabId, e?.message || String(e));
   }
 }
 
-async function getPdfFromFullTextOption(tabId, ft) {
-  const ftUrl = ft.url;
-  const ftLabel = `${ft.source || ""} ${ft.label || ""} ${ft.name || ""}`;
-  if (ft.source === "jama" || ftUrl.includes("jamanetwork") || ftUrl.includes("silverchair")) {
-    return await getPdfFromJama(tabId, ftUrl);
+// 分頁無法執行腳本時（通常是 chrome-error:// 網路層錯誤頁）盡量拼出有意義的說明：
+// 摘錄 executeScript 拋出的原始錯誤訊息，並附上分頁目前卡在哪個網址方便對照除錯。
+async function describeUnscriptablePage(tabId, rawErrorMessage) {
+  const looksLikeErrorPage = /showing error page|chrome-error|cannot access/i.test(rawErrorMessage);
+  let currentUrl = "";
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    currentUrl = tab?.url || "";
+  } catch {}
+  if (looksLikeErrorPage) {
+    return "疑似連線層級錯誤（例如跳轉太多次、連線逾時、DNS 或憑證問題），而非出版商頁面內容回傳的錯誤" +
+      "（分頁顯示瀏覽器自己的錯誤頁，程式無法讀取頁面文字）。" +
+      (currentUrl ? "分頁卡在：" + currentUrl + "。" : "") +
+      "原始錯誤：" + rawErrorMessage;
   }
-  if (ftUrl.includes("linkinghub-elsevier") || ftUrl.includes("sciencedirect")) {
-    return await getPdfFromElsevier(tabId, ftUrl);
-  }
-  if (ftUrl.includes("pmc.ncbi.nlm") || ftUrl.includes("pmc-ncbi-nlm")) {
-    return await getPdfFromPmc(tabId, ftUrl);
-  }
-  if (ftUrl.includes("serialssolutions") || ftUrl.includes("SS_UIDType")) {
-    return null;
-  }
-  if (ft.source === "scielo" || ftUrl.includes("scielo.br") || ftUrl.includes("scielo-br")) {
-    return await getPdfFromSciELORobust(tabId, ftUrl);
-  }
-  if (ft.source === "wiley" ||
-      /wiley/i.test(ftLabel) ||
-      ftUrl.includes("onlinelibrary-wiley-com") ||
-      ftUrl.includes("onlinelibrary.wiley.com")) {
-    return await getPdfFromWiley(tabId, ftUrl);
-  }
-  return await getPdfFromGenericPage(tabId, ftUrl);
-}
-
-async function getPdfFromSciELORobust(tabId, url) {
-  await navigateTab(tabId, url, 4000);
-  // SciELO 伺服器很慢（舊網址 redirect + SPA 載入可能超過一分鐘），輪詢時間要夠長
-  const deadline = Date.now() + 90000;
-
-  while (Date.now() < deadline) {
-    await sleep(500);
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab) return null;
-    const currentUrl = tab.url || url;
-    const base = currentUrl.match(/^(https?:\/\/[^/]+)/)?.[1] || "";
-
-    // 不等 DOM：只要已 redirect 到新版文章網址（/j/期刊/a/文章ID），
-    // 網址直接加 format=pdf 就是 PDF 檔案本體，不必等慢吞吞的頁面載入完
-    try {
-      const u = new URL(currentUrl);
-      if (u.hostname.includes("scielo") && /\/j\/[^/]+\/a\/[^/]+\/?$/i.test(u.pathname)) {
-        u.searchParams.set("format", "pdf");
-        if (!u.searchParams.has("lang") && u.searchParams.get("lng")) {
-          u.searchParams.set("lang", u.searchParams.get("lng"));
-        }
-        return u.href;
-      }
-    } catch {}
-
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const meta = document.querySelector("meta[name='citation_pdf_url']")?.content;
-          if (meta) return meta;
-
-          const selectors = [
-            "a[href*='format=pdf'][href*='lang=']",
-            "#btnGroupDropPDF + .dropdown-menu a[href*='format=pdf']",
-            "#ModalDownloads a[href*='format=pdf']",
-            "a.dropdown-item[href*='format=pdf']",
-            "a[href*='format=pdf']",
-            "a[href$='.pdf']"
-          ];
-
-          for (const selector of selectors) {
-            const a = document.querySelector(selector);
-            if (a?.href) return a.getAttribute("href");
-          }
-
-          const articleUrl = document.querySelector("meta[property='og:url']")?.content || location.href;
-          try {
-            const u = new URL(articleUrl, location.href);
-            if (u.hostname.includes("scielo") && /\/j\/[^/]+\/a\/[^/]+\/?$/i.test(u.pathname)) {
-              u.searchParams.set("format", "pdf");
-              if (!u.searchParams.has("lang")) {
-                const lang = document.documentElement.lang || document.querySelector("meta[name='citation_language']")?.content;
-                if (lang) u.searchParams.set("lang", lang);
-              }
-              return u.href;
-            }
-          } catch {}
-
-          return null;
-        }
-      });
-
-      const rel = r?.[0]?.result;
-      if (rel) {
-        let pdfUrl;
-        try {
-          pdfUrl = new URL(rel, currentUrl).href;
-        } catch {
-          pdfUrl = rel;
-        }
-
-        if (pdfUrl.includes("scielo.br/") && base.includes("autorpa.cmu.edu.tw")) {
-          pdfUrl = pdfUrl.replace(/^https:\/\/www\.scielo\.br/i, base);
-        }
-
-        return pdfUrl || null;
-      }
-    } catch {}
-  }
-
-  return null;
+  return "無法讀取此頁面內容以判斷失敗原因（" + rawErrorMessage + "）" +
+    (currentUrl ? "，分頁目前網址：" + currentUrl : "") + "。";
 }
 
 async function checkLogin(tabId) {
@@ -1828,491 +2003,6 @@ async function checkPageState(tabId) {
   } catch { return "ok"; }
 }
 
-async function pollForFullTextLink(tabId, maxMs) {
-  const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    await sleep(500);
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const pick = (source, label, selectors) => {
-            for (const selector of selectors) {
-              const el = document.querySelector(selector);
-              if (el?.href) {
-                const text = (el.innerText || el.getAttribute("title") || label).replace(/\s+/g, " ").trim();
-                return { source, label: text || label, url: el.href };
-              }
-            }
-            return null;
-          };
-
-          const candidates = [
-            pick("jama", "JAMA / Silverchair", [
-              "a.link-item[href*='jamanetwork-com']",
-              "a.link-item[href*='jamanetwork.com']",
-              "a.link-item[href*='silverchair']"
-            ]),
-            pick("pmc", "PMC", [
-              "a.link-item[href*='pmc.ncbi.nlm.nih.gov']",
-              "a.link-item[href*='pmc-ncbi-nlm-nih-gov']"
-            ]),
-            pick("elsevier", "Elsevier / ScienceDirect", [
-              "a.link-item[href*='linkinghub-elsevier-com']",
-              "a.link-item[href*='sciencedirect-com']"
-            ]),
-            pick("scielo", "SciELO", [
-              "a.link-item[href*='scielo.br']",
-              "a.link-item[href*='scielo-br']",
-              "a.link-item[title*='Scientific Electronic Library Online']",
-              "a.link-item[data-ga-action*='Scientific Electronic Library Online']"
-            ]),
-            pick("generic", "First full text link", [
-              "div.full-text-links-list a.link-item:not([href*='serialssolutions']):not([href*='SS_UIDType=pmid'])"
-            ]),
-            pick("serialssolutions", "CMU Library / SerialsSolutions", [
-              "a.link-item[href*='serialssolutions']",
-              "a.link-item[href*='SS_UIDType=pmid']"
-            ])
-          ].filter(Boolean);
-
-          const seen = new Set();
-          return candidates.filter(item => {
-            if (!item?.url || seen.has(item.url)) return false;
-            seen.add(item.url);
-            return true;
-          });
-        }
-      });
-      if (r?.[0]?.result?.length) return r[0].result;
-    } catch(e) {}
-  }
-  return [];
-}
-
-async function getPdfFromJama(tabId, url) {
-  await navigateTab(tabId, url, 4000);
-  const tab = await chrome.tabs.get(tabId);
-  // 慢渲染：EZproxy 下頁面常要 1-2 分鐘才渲染出 PDF 按鈕；輪詢一抓到就返回，
-  // 拉長上限只會讓「真的沒有 PDF」的頁多等，不影響成功頁的速度。
-  const deadline = Date.now() + 90000;
-  while (Date.now() < deadline) {
-    await sleep(500);
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const metaPdf = document.querySelector("meta[name='citation_pdf_url']")?.content;
-
-          const isSupplementPdf = el => {
-            const href = (el?.getAttribute("href") || el?.href || "").toLowerCase();
-            const context = [
-              el?.textContent || "",
-              el?.getAttribute("aria-label") || "",
-              el?.getAttribute("title") || "",
-              el?.className || "",
-              el?.id || "",
-              el?.closest(".supplement, [class*='supplement'], #supplemental-tab")?.textContent || "",
-              el?.closest(".supplement, [class*='supplement'], #supplemental-tab")?.className || "",
-              el?.closest(".supplement, [class*='supplement'], #supplemental-tab")?.id || ""
-            ].join(" ").toLowerCase();
-            return /(?:^|[._/-])supp(?:lement)?\d*|supplement|appendix|protocol|trial protocol|eappendix|coi\d*.*supp/i.test(href) ||
-                   context.includes("supplement") ||
-                   context.includes("trial protocol") ||
-                   context.includes("appendix");
-          };
-          const toAbsolute = value => {
-            try { return new URL(value, location.href).href; } catch { return value; }
-          };
-
-          if (metaPdf && !/supp(?:lement)?|appendix|protocol|eappendix|coi\d*.*supp/i.test(metaPdf.toLowerCase())) {
-            return metaPdf;
-          }
-
-          const primaryPdf = document.querySelector(
-            "#pdf-link[data-article-url], " +
-            "a.js-pdfaccess[data-article-url], " +
-            "a[aria-label='Download PDF'][data-article-url]"
-          );
-          const primaryUrl = primaryPdf?.getAttribute("data-article-url");
-          if (primaryUrl && !isSupplementPdf(primaryPdf)) return toAbsolute(primaryUrl);
-
-          const selectors = [
-            "a[href*='/articlepdf/']",
-            "a[href*='fullarticlepdf']",
-            "a[href*='downloadpdf']",
-            "a[aria-label*='PDF']",
-            "a[title*='PDF']",
-            "a[class*='pdf']",
-            "a[href*='.pdf']"
-          ];
-          for (const selector of selectors) {
-            const links = Array.from(document.querySelectorAll(selector));
-            const el = links.find(a => a?.href && !isSupplementPdf(a));
-            if (el?.href) return el.getAttribute("href");
-          }
-          return null;
-        }
-      });
-      const rel = r?.[0]?.result;
-      if (rel) {
-        if (rel.startsWith("/")) {
-          const base = (tab.url || "").match(/^(https?:\/\/[^/]+)/)?.[1] || "";
-          return base + rel;
-        }
-        return rel;
-      }
-    } catch(e) {}
-  }
-  return null;
-}
-
-async function getPdfFromElsevier(tabId, url) {
-  await navigateTab(tabId, url, 4000);
-  const tab = await chrome.tabs.get(tabId);
-  // 慢渲染：ScienceDirect 經 EZproxy 可能 1-2 分鐘才出 View/Download PDF 按鈕；
-  // 輪詢一抓到就返回，拉長上限只影響「真的沒 PDF」的頁。
-  const deadline = Date.now() + 90000;
-  while (Date.now() < deadline) {
-    await sleep(500);
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const b = document.querySelector(
-            "a[href*='/science/article/pii/'][href*='pdfft'], " +
-            "a[aria-label*='View PDF'], a[aria-label*='Download PDF']"
-          );
-          if (b) return b.getAttribute("href");
-          const a = document.querySelector("a[href*='pdfft']");
-          return a ? a.getAttribute("href") : null;
-        }
-      });
-      const rel = r?.[0]?.result;
-      if (rel) {
-        let pdfUrl = rel;
-        if (rel.startsWith("/")) {
-          const base = (tab.url || "").match(/^(https?:\/\/[^/]+)/)?.[1] || "";
-          pdfUrl = base + rel;
-        }
-        const clickedPdfUrl = await resolveScienceDirectPdfByClick(tabId, pdfUrl);
-        return clickedPdfUrl || pdfUrl;
-      }
-    } catch(e) {}
-  }
-  return null;
-}
-
-// ScienceDirect「View PDF / Download PDF」連結的選擇器；
-// 正式下載流程與驗證預熱共用，確保兩邊點的是同一顆按鈕
-const SD_PDF_LINK_SELECTOR =
-  "li.ViewPDF a[href*='/pdfft'], " +
-  "a[aria-label*='View PDF'][href*='/pdfft'], " +
-  "a[aria-label*='Download PDF'][href*='/pdfft'], " +
-  "a[href*='/science/article/pii/'][href*='/pdfft'], " +
-  "a[href*='/pdfft']";
-
-async function resolveScienceDirectPdfByClick(tabId, fallbackPdfUrl) {
-  try {
-    const beforeTab = await chrome.tabs.get(tabId).catch(() => null);
-    const beforeUrl = beforeTab?.url || "";
-    const clicked = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: sel => {
-        const link = document.querySelector(sel);
-        if (!link) return { ok: false, href: "" };
-        const href = new URL(link.getAttribute("href") || link.href, location.href).href;
-        link.setAttribute("target", "_self");
-        link.click();
-        return { ok: true, href };
-      },
-      args: [SD_PDF_LINK_SELECTOR]
-    });
-    const clickedHref = clicked?.[0]?.result?.href || fallbackPdfUrl || "";
-    addThreadLog("ScienceDirect View PDF clicked", { href: clickedHref });
-
-    const deadline = Date.now() + 45000;
-    while (Date.now() < deadline) {
-      await sleep(700);
-      const tab = await chrome.tabs.get(tabId).catch(() => null);
-      if (!tab) return clickedHref || fallbackPdfUrl;
-      const currentUrl = tab.url || "";
-      if (/pdf\.sciencedirectassets\.com/i.test(currentUrl) ||
-          (/\/main\.pdf(?:$|[?#])/i.test(currentUrl) && /X-Amz-|pii=|science/i.test(currentUrl))) {
-        addThreadLog("ScienceDirect signed PDF URL resolved", { url: currentUrl });
-        return currentUrl;
-      }
-
-      try {
-        const viewer = await chrome.scripting.executeScript({
-          target: { tabId },
-          world: "MAIN",
-          func: () => {
-            try {
-              const url = window.PDFViewerApplication?.url || "";
-              return url && !url.startsWith("blob:") ? new URL(url, location.href).href : "";
-            } catch {
-              return "";
-            }
-          }
-        });
-        const viewerUrl = viewer?.[0]?.result || "";
-        if (/pdf\.sciencedirectassets\.com|\/main\.pdf(?:$|[?#])/i.test(viewerUrl)) {
-          addThreadLog("ScienceDirect PDF viewer URL resolved", { url: viewerUrl });
-          return viewerUrl;
-        }
-      } catch {}
-
-      if (currentUrl !== beforeUrl &&
-          /\/science\/article\/pii\/[^/?#]+\/pdfft/i.test(currentUrl) &&
-          !/\/science\/article\/pii\/[^/?#]+(?:$|[?#])/i.test(currentUrl)) {
-        fallbackPdfUrl = currentUrl;
-      }
-    }
-    addThreadLog("ScienceDirect View PDF did not resolve signed URL in time", {
-      fallbackPdfUrl,
-      beforeUrl
-    });
-    return fallbackPdfUrl || clickedHref || null;
-  } catch(e) {
-    addThreadLog("ScienceDirect View PDF click fallback failed", {
-      message: e?.message || String(e),
-      fallbackPdfUrl
-    });
-    return fallbackPdfUrl || null;
-  }
-}
-
-async function getPdfFromPmc(tabId, url) {
-  const finalUrl = await navigateAndWaitStable(tabId, url, 2000, 20000);
-  const base = finalUrl.match(/^(https?:\/\/[^/]+)/)?.[1] || "";
-  // 慢渲染：輪詢一抓到正式 PDF 連結就返回；找不到才走 PMC 頁面列印 fallback。
-  const deadline = Date.now() + 90000;
-  while (Date.now() < deadline) {
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          let sawSupplementPdf = false;
-          const metaPdf = document.querySelector("meta[name='citation_pdf_url']")?.content;
-          const isSupplementUrl = value => {
-            const lower = String(value || "").toLowerCase();
-            return /(?:^|[._/-])supp(?:lement)?\d*(?:[._/-]|$)|supplement|appendix|protocol|trial protocol|eappendix|coi\d*.*supp|\/articles\/instance\/[^/]+\/bin\/|-[se]\d{2,4}\.pdf(?:$|[?#])/.test(lower);
-          };
-          if (metaPdf && !isSupplementUrl(metaPdf)) return metaPdf;
-          const isSupplementPdf = el => {
-            const href = (el?.getAttribute("href") || el?.href || el?.content || "").toLowerCase();
-            const block = el?.closest?.(
-              ".supplementary-materials, [class*='supplementary'], [class*='supplement'], .sm, section[id*='supplementary']"
-            );
-            const context = [
-              el?.textContent || "",
-              el?.getAttribute?.("aria-label") || "",
-              el?.getAttribute?.("title") || "",
-              el?.className || "",
-              el?.id || "",
-              el?.getAttribute?.("data-ga-action") || "",
-              block?.textContent || "",
-              block?.className || "",
-              block?.id || ""
-            ].join(" ").toLowerCase();
-            const isSupplement =
-              isSupplementUrl(href) ||
-              context.includes("supplement") ||
-              context.includes("supplementary materials") ||
-              context.includes("trial protocol") ||
-              context.includes("appendix") ||
-              context.includes("additional data file") ||
-              context.includes("click_feat_suppl");
-            if (isSupplement && /\.pdf(?:$|[?#])/.test(href)) sawSupplementPdf = true;
-            return isSupplement;
-          };
-          for (const s of [
-            "a[aria-label*='Download PDF']",
-            "a[data-ga-label*='pdf_download']",
-            "a[href^='pdf/'][href*='.pdf']",
-            "a[href*='/pdf/'][href*='.pdf']",
-            "a[href*='.pdf']",
-            "a[href*='download=1'][href*='pdf']",
-            "a.int-view[href*='.pdf']",
-            "a.pdf-link", "li.pdf a"
-          ]) {
-            const el = document.querySelector(s);
-            if (el?.content && !isSupplementPdf(el)) return el.content;
-            if (el?.href && !isSupplementPdf(el)) return el.href;
-          }
-          return sawSupplementPdf ? "__PMC_ONLY_SUPPLEMENT_PDF__" : null;
-        }
-      });
-      const href = r?.[0]?.result;
-      if (href === "__PMC_ONLY_SUPPLEMENT_PDF__") break;
-      if (href) {
-        if (/^https?:\/\//i.test(href)) return href;
-        return base + (href.startsWith("/") ? href : "/" + href);
-      }
-    } catch {}
-    await sleep(500);
-  }
-  if (await isPrintablePmcArticle(tabId)) {
-    return {
-      printPmc: true,
-      pdfUrl: "pmc-print:" + finalUrl,
-      printUrl: finalUrl || url,
-      sourceUrl: finalUrl || url,
-      label: "PMC 頁面列印成 PDF"
-    };
-  }
-  return null;
-}
-
-async function isPrintablePmcArticle(tabId) {
-  try {
-    const r = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const href = location.href;
-        const host = location.hostname.toLowerCase();
-        const isPmcHost =
-          host.includes("pmc.ncbi.nlm.nih.gov") ||
-          host.includes("pmc-ncbi-nlm-nih-gov");
-        const isPmcPath = /\/articles\/(?:pmid\/)?[^/?#]+\/?/i.test(location.pathname);
-        const isPmc = isPmcHost && isPmcPath;
-        const hasArticle = !!document.querySelector("article, main, .jig-ncbiinpagenav, #maincontent, .pmc-wm, .usa-prose");
-        const hasTitle = !!document.querySelector("h1, .content-title, .heading-title, .pmc-article-title");
-        const bodyText = (document.body?.innerText || "").slice(0, 5000).toLowerCase();
-        const blocked = bodyText.includes("request verification") || bodyText.includes("access denied") || bodyText.includes("captcha");
-        return isPmc && hasArticle && hasTitle && !blocked;
-      }
-    });
-    return !!r?.[0]?.result;
-  } catch {
-    return false;
-  }
-}
-
-async function getPdfFromWiley(tabId, url) {
-  const finalUrl = await navigateAndWaitStable(tabId, url, 3500, 22000);
-
-  // Proxy redirect loop？cookie 清理後重試，不繼續刮 16 秒
-  const recoveredFromLoop = await recoverPdfFromRedirectLoop(tabId);
-  if (recoveredFromLoop) return recoveredFromLoop;
-  if (G.cookieCleanupRequested) return null;
-
-  const deadline = Date.now() + 90000;
-  // 從「原始 full-text 連結」和導航後網址都建候選。Wiley 經 EZproxy 常要 1-2 分鐘才把
-  // PDF 按鈕渲染出來，等 JS 會逾時；而導航逾時（22 秒）那刻 finalUrl 可能還停在中途跳轉
-  // 網址、抓不到乾淨 DOI。但原始連結（.../doi/{DOI}）本來就帶 DOI，/doi/pdfdirect/{DOI}
-  // 是可直接推導的，不必等頁面 → 用它當首選候選，讓下載立即可進行。
-  const candidates = [];
-  const addUniqueCandidate = c => {
-    if (c && !candidates.includes(c)) candidates.push(c);
-  };
-  for (const c of buildWileyDirectCandidatesFromUrl(url)) {
-    addUniqueCandidate(c);
-  }
-  for (const c of buildWileyDirectCandidatesFromUrl(finalUrl)) {
-    addUniqueCandidate(c);
-  }
-  for (const c of buildPdfCandidatesFromUrl(url)) {
-    addUniqueCandidate(c);
-  }
-  for (const c of buildPdfCandidatesFromUrl(finalUrl)) {
-    addUniqueCandidate(c);
-  }
-  const addCandidate = (href, baseUrl = finalUrl) => {
-    if (!href) return;
-    try {
-      const absolute = new URL(href, baseUrl).href;
-      for (const candidate of buildWileyDirectCandidatesFromUrl(absolute)) {
-        addUniqueCandidate(candidate);
-      }
-      for (const candidate of buildPdfCandidatesFromUrl(absolute)) {
-        addUniqueCandidate(candidate);
-      }
-      addUniqueCandidate(absolute);
-    } catch {}
-  };
-
-  while (Date.now() < deadline) {
-    await sleep(500);
-    try {
-      const tab = await chrome.tabs.get(tabId).catch(() => null);
-      const currentUrl = tab?.url || finalUrl || url;
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const found = [];
-          const add = href => {
-            if (href && !found.includes(href)) found.push(href);
-          };
-          add(document.querySelector("meta[name='citation_pdf_url']")?.content);
-          for (const sel of [
-            "a.navbar-download[href*='/doi/pdfdirect/']",
-            "a[data-single-download='true'][href*='/doi/pdfdirect/']",
-            "a[href*='/doi/pdfdirect/'][href*='download=true']",
-            "a[href*='/doi/pdfdirect/']",
-            "a[href*='/doi/pdf/']",
-            "a[href*='/doi/epdf/']",
-            "a.coolBar__ctrl.pdf-download[href*='/doi/epdf/']",
-            "a[data-item-name='download-PDF']",
-            "a[aria-label*='Download PDF']",
-            "a[aria-label*='PDF'][href*='pdf']",
-            "a[title*='PDF'][href*='pdf']",
-            "a[href*='downloadpdf']",
-            ".article__access-options a[href*='pdf']",
-          ]) {
-            const el = document.querySelector(sel);
-            add(el?.getAttribute("href") || el?.href);
-          }
-          for (const a of document.querySelectorAll("a[href]")) {
-            const href = a.getAttribute("href") || "";
-            const label = ((a.textContent || "") + " " + (a.getAttribute("aria-label") || "") + " " + (a.getAttribute("title") || "")).toLowerCase();
-            if (/\/doi\/(?:pdfdirect|pdf|epdf)\//i.test(href) ||
-                (label.includes("download pdf") && href.toLowerCase().includes("pdf"))) {
-              add(href);
-            }
-          }
-          return found;
-        }
-      });
-      const hrefs = Array.isArray(r?.[0]?.result) ? r[0].result : [];
-      hrefs.forEach(href => addCandidate(href, currentUrl));
-      if (candidates.length) return candidates[0];
-    } catch {}
-  }
-  return candidates[0] || null;
-}
-
-function buildWileyDirectCandidatesFromUrl(url) {
-  try {
-    const u = new URL(url);
-    const doiMatch = u.pathname.match(/\/doi\/(?:full\/|abs\/|epdf\/|pdf\/|pdfdirect\/)?(.+)$/i);
-    const resolverDoiMatch = /(?:^|\.)doi-org(?:\.|$)|(?:^|\.)doi\.org$/i.test(u.hostname)
-      ? u.pathname.match(/^\/(10\.\d{4,9}\/.+)$/i)
-      : null;
-    const doi = (doiMatch?.[1] || resolverDoiMatch?.[1] || "").replace(/[?#].*$/, "");
-    if (!doi) return [];
-    const currentOrigin = u.hostname.endsWith(".onlinelibrary.wiley.com")
-      ? u.origin
-      : "";
-    const acsFirst = u.hostname.includes("acsjournals") || /^10\.1002\/cncr\./i.test(doi);
-    const hosts = acsFirst
-      ? ["https://acsjournals.onlinelibrary.wiley.com", "https://onlinelibrary.wiley.com"]
-      : ["https://onlinelibrary.wiley.com", "https://acsjournals.onlinelibrary.wiley.com"];
-    if (currentOrigin && !hosts.includes(currentOrigin)) hosts.unshift(currentOrigin);
-    const candidates = [];
-    for (const origin of hosts) {
-      candidates.push(origin + "/doi/epdf/" + doi);
-      candidates.push(origin + "/doi/pdfdirect/" + doi + "?download=true");
-      candidates.push(origin + "/doi/pdfdirect/" + doi);
-      candidates.push(origin + "/doi/pdf/" + doi);
-    }
-    return [...new Set(candidates)];
-  } catch {
-    return [];
-  }
-}
-
 function isCmuProxyUrl(url) {
   try {
     return new URL(url).hostname.endsWith(".autorpa.cmu.edu.tw");
@@ -2364,6 +2054,26 @@ function isChallengeClearanceCookie(name) {
 function isChallengeProtectedDomain(domain) {
   const host = String(domain || "").replace(/^\./, "").toLowerCase();
   return host === "sciencedirectassets.com" || host.endsWith(".sciencedirectassets.com");
+}
+
+// 中國知網（CNKI）的各個 proxy 子網域：EZproxy 把網域裡的「.」換成「-」，
+// 所以 oversea.cnki.net、o.oversea.cnki.net、piccache.oversea.cnki.net 等
+// 全部會變成「...-cnki-net.autorpa.cmu.edu.tw」這種型式。
+// 注意：這個函式現在只用來讓 requestCookieCleanupIfHeaderTooLarge 跳過 CNKI
+// 自家 Tomcat 通用 400 頁面的誤判（見下方），不再用來保護 cookie 不被清除——
+// 實測發現 CNKI 的 session cookie 在同一輪長時間跑下來會累積到搜尋開始出錯
+// （症狀：同一組 DOI 有時查得到、有時查不到），必須靠使用者手動清 cookie
+// 重新整個 session 才會恢復正常。真正安全的作法是：讓它跟其他出版商 proxy
+// 子網域一樣，在排程的「全部 worker 閒置」清理點被整個清掉重建（見
+// shouldRemoveCookie），而不是完全豁免。EZproxy 的登入 session 是掛在根網域
+// autorpa.cmu.edu.tw（isCmuProxyCookieDomain 保護的對象），跟這裡清的
+// CNKI 子網域 cookie 是分開的，所以清掉不會逼使用者重新登入 EZproxy，
+// 下次進 CNKI portal 會自動用既有的 EZproxy 通道重新取得一組乾淨的 session。
+function isCnkiProxyDomain(domain) {
+  const host = String(domain || "").replace(/^\./, "").toLowerCase();
+  if (!host.endsWith(".autorpa.cmu.edu.tw")) return false;
+  const sub = host.slice(0, -".autorpa.cmu.edu.tw".length);
+  return sub === "cnki-net" || sub.endsWith("-cnki-net") || sub.endsWith(".cnki-net");
 }
 
 function shouldRemoveCookie(cookie) {
@@ -2484,6 +2194,17 @@ function requestCookieCleanup(reason = "scheduled") {
 
 async function requestCookieCleanupIfHeaderTooLarge(tabId) {
   try {
+    // CNKI（中國知網）用 Tomcat，不管 400 是什麼原因（包括它自己的 Referer 來源
+    // 檢查、暫時性問題等）一律顯示同一個通用錯誤頁「HTTP Status 400 – Bad
+    // Request」——跟真正的「header 過大」完全無關，卻會命中下面寬鬆的比對條件，
+    // 誤觸發整批暫停清 cookie（清了也解決不了 Referer 驗證失敗的問題，只會
+    // 白白卡住下載，還會提早清掉還沒累積到需要重建的 CNKI session）。
+    // 所以寬鬆比對（只認「400」+「Bad Request」這種通用字樣）在 CNKI 網域上跳過，
+    // 只保留精確比對「request header is too large」這句真正明確的錯誤訊息。
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    let onCnki = false;
+    try { onCnki = isCnkiProxyDomain(new URL(tab?.url || "").hostname); } catch {}
+
     const r = await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
@@ -2492,14 +2213,17 @@ async function requestCookieCleanupIfHeaderTooLarge(tabId) {
           document.body?.innerText || "",
           document.documentElement?.innerText || ""
         ].join("\n").toLowerCase();
-        return (
-          text.includes("request header is too large") ||
-          (text.includes("http status 400") && text.includes("bad request")) ||
-          (text.includes("bad request") && text.includes("header") && text.includes("large"))
-        );
+        return {
+          exact: text.includes("request header is too large"),
+          genericBadRequest400:
+            (text.includes("http status 400") && text.includes("bad request")) ||
+            (text.includes("bad request") && text.includes("header") && text.includes("large"))
+        };
       }
     });
-    if (r?.[0]?.result === true) {
+    const result = r?.[0]?.result;
+    const triggered = !!result?.exact || (!onCnki && !!result?.genericBadRequest400);
+    if (triggered) {
       addLog("偵測到 Request header 過大，將清理非必要 cookie 後重試。", "warn");
       addThreadLog("Header too large detected on current tab.", { tabId });
       requestCookieCleanup("header-too-large");
@@ -2521,37 +2245,6 @@ function restoreCmuProxyUrl(url) {
     return "https://" + originalHost + u.pathname + u.search + u.hash;
   } catch {
     return null;
-  }
-}
-
-function buildPdfCandidatesFromUrl(url) {
-  try {
-    const u = new URL(url);
-    const candidates = [];
-    // 必須用 u.host（含 :8443 port）而不是 u.hostname：
-    // EZproxy 網址掉了 port 會連到錯的伺服器，下載直接中斷
-    const origin = "https://" + u.host;
-
-    const doiMatch = u.pathname.match(/\/doi\/(?:full\/|abs\/|epdf\/|pdf\/|pdfdirect\/)?(.+)$/i);
-    if (doiMatch?.[1]) {
-      const doi = doiMatch[1].replace(/[?#].*$/, "");
-      if (u.hostname.includes("wiley")) {
-        candidates.push(origin + "/doi/pdfdirect/" + doi + "?download=true");
-      }
-      // Atypon 平台（ascopubs、sagepub 等）的 /doi/pdf/ 是內嵌 viewer 頁面，
-      // /doi/pdfdirect/ 才是真正的 PDF 檔案，優先嘗試
-      candidates.push(origin + "/doi/pdfdirect/" + doi);
-      candidates.push(origin + "/doi/pdf/" + doi);
-      candidates.push(origin + "/doi/epdf/" + doi);
-    }
-
-    if (/\.pdf(?:$|[?#])/i.test(url) || /\/(?:pdf|epdf|pdfdirect)\//i.test(u.pathname)) {
-      candidates.push(url);
-    }
-
-    return [...new Set(candidates)];
-  } catch {
-    return [];
   }
 }
 
@@ -2612,14 +2305,19 @@ async function tabShowsManualVerification(tabId) {
 
 // 宣告需要人工驗證：暫停派發、開前景分頁（或沿用 existingTabId 的分頁）、
 // 通知使用者，並啟動自動偵測。force=true 時不受 manualVerifyPause 開關限制（驗證預熱用）
-async function requestManualVerificationPause(url, contextLabel = "", existingTabId = null, force = false) {
+// preserveExistingTab=true：existingTabId 是 worker 的常駐背景分頁（tab pool 的一員），
+// 驗證結束後不能被關掉（否則該 worker 之後所有操作都會對著一個已關閉的 tabId 失敗）。
+// 只有「特地為了這次驗證開的用完即丟分頁」（LWW 中轉彈窗、預熱探測分頁）才該在
+// finishManualVerification 裡自動關閉，其餘一律保留、由呼叫端自行決定何時清理/導回 about:blank。
+async function requestManualVerificationPause(url, contextLabel = "", existingTabId = null, force = false, preserveExistingTab = false) {
   if ((!G.manualVerifyPause && !force) || G.stopped) return false;
   if (G.verifyPending) return true; // 已有一場驗證等待中，這篇會在驗證後重試
   G.verifyPending = true;
   G.verifyPendingUrl = url;
   G.verifyRestartEpoch = (G.verifyEpoch || 0) + 1;
+  G.verifyPreserveTab = !!(existingTabId != null && preserveExistingTab);
   addLog("⚠ 偵測到人機驗證（" + (contextLabel || url) + "），暫停派發新任務，請到開啟的分頁完成驗證。", "bot");
-  addThreadLog("Manual verification pause requested", { url, contextLabel, existingTabId });
+  addThreadLog("Manual verification pause requested", { url, contextLabel, existingTabId, preserveExistingTab });
 
   let tab = null;
   try {
@@ -2681,8 +2379,11 @@ function finishManualVerification(how) {
   G.verifyEpoch = (G.verifyEpoch || 0) + 1;
   G.verifyPendingUrl = "";
   const tabId = G.verifyPendingTabId;
+  const preserveTab = G.verifyPreserveTab;
   G.verifyPendingTabId = null;
-  if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});
+  G.verifyPreserveTab = false;
+  // worker 的常駐分頁不能關；用完即丟的驗證/中轉分頁才關閉
+  if (tabId != null && !preserveTab) chrome.tabs.remove(tabId).catch(() => {});
   try { chrome.notifications.clear("manual-verify"); } catch {}
   const label = how === "user" ? "使用者確認"
               : how === "tab-closed" ? "驗證分頁已關閉"
@@ -2863,304 +2564,6 @@ async function recoverPdfFromRedirectLoop(tabId) {
   }
 }
 
-async function getPdfFromGenericPage(tabId, url) {
-  try {
-    const u = new URL(url);
-    if (/\.pdf(?:$|[?#])/i.test(url) || /\/(?:pdf|epdf)\//i.test(u.pathname)) {
-      return url;
-    }
-  } catch {}
-
-  const finalUrl = await navigateAndWaitStable(tabId, url, 2000, 20000);
-  const currentUrl = finalUrl || url;
-  if (/zhenciyanjiu\.cn/i.test(currentUrl) || /zhenciyanjiu\.cn/i.test(url)) {
-    const zcyPdf = await getPdfFromZhenciYanjiu(tabId, currentUrl);
-    if (zcyPdf) return zcyPdf;
-  }
-  // 從原始連結和導航後網址都建候選：帶 DOI 的站（Atypon 家族）可直接推導 PDF，
-  // 不必等 1-2 分鐘的慢渲染；導航逾時那刻 finalUrl 可能還在中途跳轉，故也用原始 url。
-  const currentCandidates = buildPdfCandidatesFromUrl(currentUrl);
-  for (const c of buildPdfCandidatesFromUrl(url)) {
-    if (!currentCandidates.includes(c)) currentCandidates.push(c);
-  }
-  if (currentCandidates.length) return currentCandidates[0];
-
-  const recoveredPdf = await recoverPdfFromRedirectLoop(tabId);
-  if (recoveredPdf) return recoveredPdf;
-
-  // 慢渲染：輪詢一抓到 PDF 連結就返回；拉長上限只影響「真的沒 PDF」的頁。
-  const deadline = Date.now() + 90000;
-  let navigationErrorHandled = false;
-  while (Date.now() < deadline) {
-    // pdf.js 檢視頁（如 zhenciyanjiu 的 previewFile）：頁面上沒有指向 PDF 的 <a>，
-    // 真正的檔案 URL 要從 MAIN world 的 PDFViewerApplication 讀出來
-    try {
-      const isViewer = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => !!document.getElementById("download") &&
-                    !!(document.getElementById("viewerContainer") || document.querySelector(".pdfViewer"))
-      });
-      if (isViewer?.[0]?.result) {
-        const viewerPdf = await readPdfJsViewerUrl(tabId);
-        if (viewerPdf) return viewerPdf;
-      }
-    } catch {}
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const metaPdf = document.querySelector("meta[name='citation_pdf_url']")?.content
-                       || document.querySelector("meta[name='dc.identifier'][content$='.pdf']")?.content;
-          if (metaPdf) return metaPdf;
-
-          // Wolters Kluwer / LWW（journals.lww.com）：PDF 連結不是 <a>，而是掛在
-          // 文章工具列容器的 data-pdf-url 屬性（Download → PDF 按鈕觸發的網址，
-          // 指向 _layouts/15/oaks.journals/downloadpdf.aspx）。掃 <a> 永遠找不到。
-          const lwwToolsEl = document.querySelector("[data-pdf-url]");
-          if (lwwToolsEl) {
-            const lwwPdfUrl = lwwToolsEl.getAttribute("data-pdf-url") || "";
-            const lwwPdfEnabled = (lwwToolsEl.getAttribute("data-pdf-enabled") || "true").toLowerCase() !== "false";
-            if (lwwPdfUrl && lwwPdfEnabled) {
-              try { return new URL(lwwPdfUrl, location.href).href; } catch {}
-            }
-          }
-
-          if (location.hostname.includes("scielo")) {
-            const scieloPdfLink = document.querySelector("a[href*='format=pdf']")?.getAttribute("href");
-            if (scieloPdfLink) return new URL(scieloPdfLink, location.href).href;
-
-            const articleUrl = document.querySelector("meta[property='og:url']")?.content || location.href;
-            try {
-              const u = new URL(articleUrl, location.href);
-              if (/\/j\/[^/]+\/a\/[^/]+\/?$/i.test(u.pathname)) {
-                u.searchParams.set("format", "pdf");
-                if (!u.searchParams.has("lang")) {
-                  const lang = document.documentElement.lang || document.querySelector("meta[name='citation_language']")?.content;
-                  if (lang) u.searchParams.set("lang", lang);
-                }
-                return u.href;
-              }
-            } catch {}
-          }
-
-          const toAbsoluteUrl = value => {
-            try {
-              return new URL(value, location.href).href;
-            } catch {
-              return value;
-            }
-          };
-
-          const scoreCandidate = (href, rawHref, text, label) => {
-            const cleanHref = href.split(/[?#]/)[0].toLowerCase();
-            const cleanCurrent = location.href.split(/[?#]/)[0].toLowerCase();
-            const lowerHref = href.toLowerCase();
-            const lowerRawHref = rawHref.toLowerCase();
-            const lowerText = String(text || "").toLowerCase();
-            const lowerLabel = String(label || "").toLowerCase();
-            const isSupplement =
-              /(?:^|[._/-])supp(?:lement)?\d*|supplement|appendix|protocol|trial protocol|eappendix|coi\d*.*supp/i.test(lowerHref) ||
-              /supplement|appendix|trial protocol|eappendix/.test(lowerText + " " + lowerLabel);
-            const blockedHosts = [
-              "miit.gov.cn",
-              "doaj.org",
-              "google.com",
-              "scholar.google",
-              "crossref.org",
-              "orcid.org",
-              "altmetric.com",
-              "dimensions.ai",
-              "plu.mx",
-              "scite.ai",
-              "addtoany.com",
-              "facebook.com",
-              "twitter.com",
-              "x.com",
-              "linkedin.com"
-            ];
-            const blocked = href.startsWith("javascript:") ||
-                            href.startsWith("mailto:") ||
-                            href.startsWith("tel:") ||
-                            cleanHref === cleanCurrent ||
-                            isSupplement ||
-                            blockedHosts.some(host => lowerHref.includes(host));
-            let score = 0;
-            if (cleanHref.endsWith(".pdf")) score += 100;
-            if (cleanHref.includes("/pdf/") || cleanHref.includes("pdfft") || cleanHref.includes("downloadpdf")) score += 60;
-            if (lowerHref.includes("/download") && lowerHref.includes("attachtype=")) score += 80;
-            if (lowerHref.includes("lowqualitypdf") || lowerHref.includes("highqualitypdf") || lowerHref.includes("fulltextpdf")) score += 100;
-            if (lowerRawHref.includes(".pdf")) score += 40;
-
-            if (lowerHref.includes("format=pdf") || lowerRawHref.includes("format=pdf")) score += 80;
-            if (lowerHref.includes("previewfile") || lowerHref.includes("type=pdf")) score += 80;
-            if (/\bpdf\b/.test(label)) score += 30;
-            if (label.includes("file-pdf") || label.includes("pdf_link") || label.includes("dropdown-item")) score += 10;
-            if (text === "pdf" || text.toLowerCase().includes("download pdf")) score += 20;
-            if (cleanHref.endsWith(".xml") || text === "xml" || label.includes("file-code") || lowerHref.includes("attachtype=metaxml")) score -= 100;
-            return { href, score, blocked };
-          };
-
-          const candidates = [];
-
-          for (const a of Array.from(document.querySelectorAll("a[href]"))) {
-            const rawHref = a.getAttribute("href") || "";
-            const href = toAbsoluteUrl(rawHref);
-            const text = (a.textContent || "").trim().toLowerCase();
-            const label = [
-              text,
-              a.getAttribute("aria-label") || "",
-              a.getAttribute("title") || "",
-              a.className || "",
-              a.querySelector("i")?.className || ""
-            ].join(" ").toLowerCase();
-            candidates.push(scoreCandidate(href, rawHref, text, label));
-          }
-
-          for (const el of Array.from(document.querySelectorAll("[data-matomoclick]"))) {
-            const rawData = el.getAttribute("data-matomoclick") || "";
-            const matches = rawData.match(/https?:\/\/[^'"\],\s]+/g) || [];
-            for (const rawHref of matches) {
-              const href = toAbsoluteUrl(rawHref.replace(/&amp;/g, "&"));
-              const text = (el.textContent || "").trim().toLowerCase();
-              const label = [
-                text,
-                el.getAttribute("aria-label") || "",
-                el.getAttribute("title") || "",
-                el.className || "",
-                rawData
-              ].join(" ").toLowerCase();
-              candidates.push(scoreCandidate(href, rawHref, text, label));
-            }
-          }
-
-          const usableCandidates = candidates.filter(item => !item.blocked);
-          usableCandidates.sort((a, b) => b.score - a.score);
-
-          // 絕不退回 score 0 的任意連結——之前會抓到頁尾的備案/社群連結
-          // 之類完全無關的網址拿去當 PDF 下載
-          const best = usableCandidates.find(item => item.score > 0);
-          if (best) return best.href;
-
-          // SPA 頁面的 PDF 按鈕可能不是 <a>（如 zhenciyanjiu 的 <p class="citeBtn">PDF</p>），
-          // 點一下讓頁面切到 PDF 檢視頁，外層輪詢會重掃新頁面
-          if (!window.__pdfBtnClicked) {
-            const clickable = Array.from(document.querySelectorAll("p, button, span, div, a"))
-              .find(el => (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === "pdf" &&
-                          el.offsetParent !== null && el.children.length <= 2);
-            if (clickable) {
-              window.__pdfBtnClicked = true;
-              clickable.click();
-            }
-          }
-          return null;
-        }
-      });
-      const pdfUrl = normalizePdfUrlValue(r?.[0]?.result);
-      if (pdfUrl) return pdfUrl;
-    } catch(e) {
-      const message = e?.message || String(e);
-      if (!navigationErrorHandled && /showing error page|chrome-error|cannot access/i.test(message)) {
-        navigationErrorHandled = true;
-        const candidates = buildPdfCandidatesFromUrl(url);
-        addThreadLog("Generic PDF parser hit browser error page", {
-          url,
-          message,
-          fallbackCandidate: candidates[0] || ""
-        });
-        if (isCmuProxyUrl(url)) {
-          requestCookieCleanup("proxy 連線錯誤，需要清理後重試");
-        }
-        if (candidates.length) return candidates[0];
-        return null;
-      }
-    }
-    await sleep(500);
-  }
-  return null;
-}
-
-async function readPdfJsViewerUrl(tabId) {
-  try {
-    const rv = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: () => {
-        try {
-          const frameSrc = Array.from(document.querySelectorAll("iframe[src], embed[src]"))
-            .map(el => el.getAttribute("src") || "")
-            .find(src => /\/PDFJS\/web\/viewer\.html/i.test(src) && /[?&]file=/i.test(src));
-          if (frameSrc) {
-            const rawFile = (frameSrc.match(/[?&]file=([\s\S]+)$/i)?.[1] || "").replace(/&amp;/g, "&");
-            const file = rawFile
-              ? (/^https?%3A/i.test(rawFile) ? decodeURIComponent(rawFile) : rawFile)
-              : new URL(frameSrc, location.href).searchParams.get("file");
-            if (file && !file.startsWith("blob:")) return new URL(file, location.href).href;
-          }
-
-          const u = window.PDFViewerApplication?.url || null;
-          if (!u || u.startsWith("blob:")) return null;
-          return new URL(u, location.href).href;
-        } catch { return null; }
-      }
-    });
-    return rv?.[0]?.result || null;
-  } catch {
-    return null;
-  }
-}
-
-async function getPdfFromZhenciYanjiu(tabId, url) {
-  const deadline = Date.now() + 60000;
-  let clicked = false;
-  while (Date.now() < deadline) {
-    await sleep(500);
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    const currentUrl = tab?.url || url;
-    if (/\/previewFile\b/i.test(currentUrl) && /(?:[?&])type=pdf\b/i.test(currentUrl)) {
-      const viewerPdf = await readPdfJsViewerUrl(tabId);
-      if (viewerPdf && viewerPdf !== currentUrl) return viewerPdf;
-    }
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: shouldClick => {
-          const current = location.href;
-          if (/\/previewFile\b/i.test(current) && /(?:[?&])type=pdf\b/i.test(current)) return "__VIEWER__";
-
-          const direct = Array.from(document.querySelectorAll("a[href], iframe[src], embed[src]"))
-            .map(el => el.getAttribute("href") || el.getAttribute("src") || "")
-            .find(v => /previewFile/i.test(v) && /(?:[?&])type=pdf\b/i.test(v));
-          if (direct) return new URL(direct, location.href).href;
-
-          if (!shouldClick) return null;
-          const citeBtn = Array.from(document.querySelectorAll(".citeBtn, p, button, span, div, a"))
-            .find(el =>
-              (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === "pdf" &&
-              (el.className || "").toString().toLowerCase().includes("citebtn")
-            );
-          const genericPdfBtn = Array.from(document.querySelectorAll("p, button, span, div, a"))
-            .find(el =>
-              (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase() === "pdf" &&
-              el.offsetParent !== null &&
-              el.children.length <= 2
-            );
-          const pdfBtn = citeBtn || genericPdfBtn;
-          if (pdfBtn) {
-            pdfBtn.click();
-            return "__CLICKED__";
-          }
-          return null;
-        },
-        args: [!clicked]
-      });
-      const result = r?.[0]?.result;
-      if (result && result !== "__CLICKED__" && result !== "__VIEWER__") return result;
-      if (result === "__CLICKED__") clicked = true;
-    } catch {}
-  }
-  return null;
-}
-
 function sanitizeDownloadFolder(folder) {
   const cleaned = String(folder || "PubMed_PDFs")
     .replace(/\\/g, "/")
@@ -3169,6 +2572,26 @@ function sanitizeDownloadFolder(folder) {
     .filter(Boolean)
     .join("/");
   return cleaned || "PubMed_PDFs";
+}
+
+// 清理後標題可能撞名（不同 PMID、不同原始標題，但清理特殊字元/截斷後變成同一個
+// 檔名）。以前直接覆蓋會讓後面幾篇的 PDF 悄悄取代前一篇，Excel 卻都記著「下載成功」。
+// 用「folder+檔名(小寫)」當 key，依 rowIndex 排隊認領：第一個認領到的維持原檔名，
+// 之後撞名的依序加上 " (2)"、" (3)"…；同一 rowIndex 重跑（重試）沿用原本認領的檔名。
+function claimDownloadFilename(item, folder, ext = ".pdf") {
+  const dir = sanitizeDownloadFolder(folder);
+  const baseTitle = item.safeTitle || ("PMID_" + (item.pmid || "unknown"));
+  const baseKey = (dir + "/" + baseTitle + ext).toLowerCase();
+  G.filenameClaims = G.filenameClaims || {};
+  let claims = G.filenameClaims[baseKey];
+  if (!claims) { claims = []; G.filenameClaims[baseKey] = claims; }
+  const mine = claims.find(c => c.rowIndex === item.rowIndex);
+  if (mine) return { finalName: mine.finalName, duplicate: mine.duplicate };
+  const suffix = claims.length;
+  const finalName = suffix === 0 ? baseTitle : `${baseTitle} (${suffix + 1})`;
+  const duplicate = suffix > 0;
+  claims.push({ rowIndex: item.rowIndex, finalName, duplicate });
+  return { finalName, duplicate };
 }
 
 function getBatchFolderForIndex(idx) {
@@ -3180,25 +2603,83 @@ function getBatchFolderForIndex(idx) {
   return base + "/第" + start + "-" + end + "篇";
 }
 
-function createFailureNote(item, status, folder, reason = "", fullTextLinks = [], linkAttempts = [], procLog = []) {
+// 把一個 stageResult({ok, detail}) 轉成一行「XX: 成功/失敗/未執行（說明）」文字。
+// null/undefined（該階段根本沒跑到，被前面某個失敗擋住）一律顯示「未執行」。
+function renderStageLine(label, stage) {
+  if (!stage || stage.ok == null) {
+    return label + ": 未執行" + (stage?.detail ? "（" + stage.detail + "）" : "（前面步驟已中止或跳過）");
+  }
+  return label + ": " + (stage.ok ? "成功" : "失敗") + (stage.detail ? "（" + stage.detail + "）" : "");
+}
+
+// 中文論文查詢流程（CNKI）分段報告：進入中國知網 / 以 DOI 找到目標論文 / 目標論文下載
+function renderChineseFailureSection(chinese) {
+  const lines = ["──────── 中文論文查詢流程（CNKI）────────"];
+  lines.push(renderStageLine("進入中國知網", chinese?.enteredPortal));
+  lines.push(renderStageLine("以 DOI 找到目標論文", chinese?.doiFound));
+  lines.push(renderStageLine("目標論文下載", chinese?.downloadSucceeded));
+  if (chinese?.otherReason) lines.push("其他失敗原因: " + chinese.otherReason);
+  return lines;
+}
+
+// PubMed 搜尋流程分段報告：進入 PubMed 網頁 / 找到目標論文 / 是否有 Full Text 連結，
+// 再逐一列出每個 Full Text 連結是否找到合乎目標的 PDF。
+function renderPubmedFailureSection(pubmed, isFallback) {
+  const lines = [
+    "──────── PubMed 搜尋流程" + (isFallback ? "（中文查詢流程未取得 PDF 後的 fallback）" : "") + " ────────"
+  ];
+  lines.push(renderStageLine("進入 PubMed 網頁", pubmed?.entered));
+  lines.push(renderStageLine("以 Title/PMID 找到目標論文", pubmed?.articleFound));
+
+  const ftl = pubmed?.fullTextLinks;
+  if (!ftl || ftl.ok == null) {
+    lines.push("該目標論文是否存在 Full Text 連結: 未執行（前面步驟已中止）");
+  } else if (ftl.ok) {
+    lines.push("該目標論文是否存在 Full Text 連結: 成功，" + (ftl.detail || ""));
+    (ftl.list || []).forEach((l, i) => lines.push("  [" + (i + 1) + "] " + l.label + " — " + l.url));
+  } else {
+    lines.push("該目標論文是否存在 Full Text 連結: 失敗（無可用的 Full Text 連結）");
+  }
+
+  const attempts = pubmed?.linkAttempts || [];
+  if (attempts.length) {
+    lines.push("");
+    lines.push("──── 各 Full Text 連結嘗試明細 ────");
+    attempts.forEach((a, i) => {
+      lines.push("[" + (i + 1) + "] " + a.label + "（" + a.url + "）");
+      lines.push("    該連結內是否找到合乎目標之 PDF: " +
+        (a.pdfFound?.ok ? "成功" : "失敗") +
+        (a.pdfFound?.detail ? "（" + a.pdfFound.detail + "）" : ""));
+    });
+  }
+  return lines;
+}
+
+function createFailureNote(item, status, folder, reason = "", fullTextLinks = [], linkAttempts = [], pdfDownloadAttempts = [], procLog = [], report = null) {
   const pmid = item.pmid || "no-pmid";
   const rawTitle = item.safeTitle || item.title || ("PMID_" + pmid) || "untitled";
   const safeTitle = sanitizeDownloadFolder(rawTitle).replace(/\//g, " ").substring(0, 120) || ("PMID_" + pmid);
   const reasonText = reason || "缺少詳細失敗原因。";
+  const isChinese = report ? !!report.isChineseTitle : isBracketedChineseTitle(item);
 
-  const links = fullTextLinks || [];
-  const linksText = links.length
-    ? links.map((ft, i) => "  " + (i + 1) + ". " + (ft.label || ft.source || "unknown") + "\n     " + ft.url).join("\n")
-    : "  無；PubMed 頁面沒有可用的 Full Text 連結。";
+  const sections = [];
+  if (isChinese) {
+    sections.push(...renderChineseFailureSection(report?.chinese));
+    sections.push("");
+  }
+  sections.push(...renderPubmedFailureSection(report?.pubmed, isChinese));
 
-  const attemptsSection = linkAttempts?.length
-    ? ["", "連結嘗試紀錄（共 " + linkAttempts.length + " 筆）：", linkAttempts.map((a, i) => "  " + (i + 1) + ". " + a).join("\n")]
-    : ["", "連結嘗試紀錄：無詳細紀錄（可能在取得 Full Text link 前就失敗）。"];
-  const triedAllLinks = links.length > 0 && linkAttempts?.length >= links.length
-    ? "是"
-    : links.length > 0
-      ? "不完整，請查看下方嘗試紀錄。"
-      : "沒有可嘗試的 Full Text link。";
+  // 備援：極少數情況下（例如 report 沒能正常產生）才會用到這段原始文字紀錄，
+  // 正常情況下上面的分段報告已經完整涵蓋這裡的內容，不會重複顯示。
+  const legacySection = (!report && linkAttempts?.length)
+    ? ["", "──────── 連結嘗試紀錄（備援，未取得分段報告）────────",
+       linkAttempts.map((a, i) => "  " + (i + 1) + ". " + a).join("\n")]
+    : [];
+
+  const downloadAttemptsSection = pdfDownloadAttempts?.length
+    ? ["", "──────── PDF 下載嘗試明細（找到連結後的實際下載結果）────────",
+       pdfDownloadAttempts.map((a, i) => "  " + (i + 1) + ". " + a).join("\n")]
+    : [];
 
   const procSection = procLog?.length
     ? ["", "──────── 處理過程紀錄（本篇，含 preflight/預熱/下載細節）────────", procLog.join("\n")]
@@ -3208,15 +2689,14 @@ function createFailureNote(item, status, folder, reason = "", fullTextLinks = []
     "錯誤論文Title: " + (item.title || ""),
     "PMID / id: " + pmid,
     "Excel row: " + (item.rowIndex || ""),
+    "失敗期刊類型: " + (isChinese ? "中文" : "非中文"),
     "下載狀況: " + status,
     "失敗原因: " + reasonText,
     "Time: " + new Date().toISOString(),
     "",
-    "找到的 Full Text 連結（共 " + links.length + " 個）:",
-    linksText,
-    "",
-    "是否已嘗試所有 Full Text link: " + triedAllLinks,
-    ...attemptsSection,
+    ...sections,
+    ...legacySection,
+    ...downloadAttemptsSection,
     ...procSection
   ].join("\n");
   const url = "data:text/plain;charset=utf-8," + encodeURIComponent(body);
@@ -3476,7 +2956,10 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
         // （重跑會拿到全新的簽名 PDF URL，舊的 5 分鐘就過期了）
         rec("  偵測到需要人工驗證的頁面，已開啟驗證分頁等待使用者完成，通過後自動重試此篇。");
         addThreadLog("Manual verification required; pausing for user", { pdfUrl });
-        await requestManualVerificationPause(warmUrl, "ScienceDirect / 出版社驗證頁");
+        // tabId 這裡已經導航到 warmUrl（上面的 navigateTab）並正顯示著挑戰畫面，
+        // 沿用同一個分頁，不要另開一個沒導航過的新分頁（會看不到挑戰內容）；
+        // 這是 worker 的常駐分頁，驗證結束後不能被關掉
+        await requestManualVerificationPause(warmUrl, "ScienceDirect / 出版社驗證頁", tabId, false, true);
         G.lastPdfFailureReason = "需要人工驗證：已暫停等待使用者完成驗證，通過後自動重試。URL: " + pdfUrl;
         return false;
       }
@@ -3836,7 +3319,16 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
     // warmup 站台（ScienceDirect 等）的驗證已在 warmUpAntiBotChallenge 內處理過。
     if (diag.manualVerification && G.manualVerifyPause && !G.stopped && !urlNeedsChallengeWarmup(pdfUrl)) {
       rec("偵測到人機驗證頁，已開啟驗證分頁等待使用者完成，通過後自動重試此篇。");
-      await requestManualVerificationPause(pdfUrl, "出版社驗證頁");
+      // 驗證頁必須開在「真的被擋下來的那個網址」上使用者才看得到挑戰畫面：
+      // 之前直接開新分頁只帶著 URL、沒有先導航，常常變成一個空白/看不到驗證的分頁。
+      // 這裡改成先把本篇的 worker 分頁導到 pdfUrl（讓 Cloudflare 挑戰真的渲染出來），
+      // 再沿用同一個分頁請求暫停，使用者切過去就是原本卡住的那個畫面。
+      if (tabId != null) {
+        await navigateTab(tabId, pdfUrl, 1200).catch(() => {});
+        await requestManualVerificationPause(pdfUrl, "出版社驗證頁", tabId, false, true);
+      } else {
+        await requestManualVerificationPause(pdfUrl, "出版社驗證頁");
+      }
     }
     addThreadLog("Preflight rejected candidate (not a PDF)", { pdfUrl });
     rec("結果：放棄此候選（確定非 PDF）");

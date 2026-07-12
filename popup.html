@@ -381,6 +381,17 @@
     <span class="delay-note">0 = 不限制；設 n 時，完成 n 篇（成功＋失敗均計）後自動停止</span>
   </div>
 
+  <!-- 測試下載區塊（Debug 用，獨立於一般下載流程） -->
+  <div id="testDownloadSection" style="display:none; flex-direction:column; align-items:stretch; gap:6px; background:#fff7ed; border:1px dashed #f59e0b; border-radius:6px; margin:8px 10px; padding:8px 10px;">
+    <div style="font-weight:700; font-size:12px; color:#92400e;">🧪 測試下載（Debug 用）</div>
+    <div style="font-size:11px; color:#92400e;">貼上 PMID 或 Title（每行一個）；會忽略下載狀況、Storage 完成紀錄與 Column M 篩選，直接強制下載指定文獻。</div>
+    <textarea id="testDownloadInput" rows="3" placeholder="例如：&#10;39658376&#10;Acupuncture for the prevention of..." style="font-size:12px; font-family:inherit; padding:6px; border:1px solid #fbbf24; border-radius:4px; resize:vertical;"></textarea>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button type="button" id="testDownloadBtn" style="background:#f59e0b; color:#fff; border:none; border-radius:4px; padding:5px 12px; font-size:12px; cursor:pointer;">🧪 測試下載指定文獻</button>
+      <span class="delay-note" id="testDownloadMatchInfo"></span>
+    </div>
+  </div>
+
   <!-- 統計欄位 -->
   <div class="stats-grid" id="statsGrid">
     <div class="stat-box total"><div class="num" id="sTotal">0</div><div class="lbl">總數</div></div>

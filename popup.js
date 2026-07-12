@@ -7,8 +7,10 @@
 // ── 欄位對應（0-based index）──
 const COL_PMID    = 1;   // B
 const COL_TITLE   = 2;   // C
+const COL_DOI     = 11;  // L（DOI）
 const COL_INCLUDE = 12;  // M
 const COL_RESULT  = 17;  // R（原始是否可取得全文）
+const COL_LANG    = 18;  // S（語言）
 const COL_STATUS  = 21;  // V（下載狀況，本程式寫入）
 const SHEET_NAME  = "CANCER papers(all years)";
 
@@ -28,6 +30,10 @@ const politeModeInput  = document.getElementById("politeModeInput");
 const startFromInput   = document.getElementById("startFromInput");
 const stopAfterInput   = document.getElementById("stopAfterInput");
 const stopAfterRow     = document.getElementById("stopAfterRow");
+const testDownloadSection  = document.getElementById("testDownloadSection");
+const testDownloadInput    = document.getElementById("testDownloadInput");
+const testDownloadBtn      = document.getElementById("testDownloadBtn");
+const testDownloadMatchInfo = document.getElementById("testDownloadMatchInfo");
 // 進階設定面板（人機驗證選項＋出版商 API 憑證）的 UI 邏輯在 api_settings.js（AdvancedSettings）
 const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
 const preVerifyInput   = document.getElementById("preVerifyInput");
@@ -695,11 +701,14 @@ function parseExcel(arrayBuffer, mode, options = {}) {
 
   const rows  = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
 
-  // 動態找「下載狀況」欄位（允許不在固定欄）
+  // 動態找「下載狀況」「語言」欄位（允許不在固定欄）
   const headerRow = rows[0] || [];
   let statusColIdx = COL_STATUS;
+  let langColIdx   = COL_LANG;
   for (let c = 0; c < headerRow.length; c++) {
-    if (String(headerRow[c] || "").trim() === "下載狀況") { statusColIdx = c; break; }
+    const h = String(headerRow[c] || "").trim();
+    if (h === "下載狀況") statusColIdx = c;
+    else if (h === "語言") langColIdx = c;
   }
 
   const found = [];
@@ -724,6 +733,8 @@ function parseExcel(arrayBuffer, mode, options = {}) {
     const pmid      = Number.isFinite(pmidNum) && pmidNum > 0 ? String(pmidNum) : null;
     const titleStr  = title ? String(title).trim() : "";
     const safeTitle = sanitizeFilename(titleStr);
+    const language   = String(row[langColIdx] || "").trim();
+    const doi        = String(row[COL_DOI] || "").trim();
 
     // ── 斷點續傳：跳過上次已成功或失敗的列 ──
     const prevStatus = String(row[statusColIdx] || "").trim();
@@ -742,6 +753,8 @@ function parseExcel(arrayBuffer, mode, options = {}) {
       pmid,
       title:     titleStr,
       safeTitle,
+      language,
+      doi,
       status:    prevStatus || STATUS_PENDING,
     });
   }
@@ -751,6 +764,80 @@ function parseExcel(arrayBuffer, mode, options = {}) {
   }
 
   return found;
+}
+
+// ══════════════════════════════════
+// 測試下載（Debug 用）：依指定的 PMID / Title 從 Excel 找出對應列，
+// 完全忽略 Column M 篩選與「下載狀況」斷點續傳跳過邏輯 —— 只要指定到就一定下載。
+// 回傳 { items, unmatchedQueries }
+// ══════════════════════════════════
+function parseExcelForTest(arrayBuffer, queryLines) {
+  if (typeof XLSX === "undefined") throw new Error("SheetJS 未載入");
+  const wb = XLSX.read(arrayBuffer, { type: "array", cellDates: true });
+
+  let ws = wb.Sheets[SHEET_NAME];
+  if (!ws) {
+    ws = wb.Sheets[wb.SheetNames[1]] || wb.Sheets[wb.SheetNames[0]];
+    if (!ws) throw new Error(`找不到工作表「${SHEET_NAME}」`);
+  }
+
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+  const headerRow = rows[0] || [];
+  let statusColIdx = COL_STATUS;
+  let langColIdx   = COL_LANG;
+  for (let c = 0; c < headerRow.length; c++) {
+    const h = String(headerRow[c] || "").trim();
+    if (h === "下載狀況") statusColIdx = c;
+    else if (h === "語言") langColIdx = c;
+  }
+
+  // 先把所有列轉成完整 item（不套用任何篩選/跳過邏輯）
+  const allRows = [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.every(v => v === null)) continue;
+    const pmidRaw = row[COL_PMID];
+    const title   = row[COL_TITLE];
+    if (!pmidRaw && !title) continue;
+    const pmidNum   = pmidRaw != null ? parseInt(String(pmidRaw).trim(), 10) : NaN;
+    const pmid      = Number.isFinite(pmidNum) && pmidNum > 0 ? String(pmidNum) : null;
+    const titleStr  = title ? String(title).trim() : "";
+    allRows.push({
+      rowIndex:  i + 1,
+      pmid,
+      title:     titleStr,
+      safeTitle: sanitizeFilename(titleStr),
+      language:  String(row[langColIdx] || "").trim(),
+      doi:       String(row[COL_DOI] || "").trim(),
+      status:    String(row[statusColIdx] || "").trim() || STATUS_PENDING,
+    });
+  }
+
+  const matchedByRowIndex = new Map();
+  const unmatchedQueries = [];
+
+  queryLines.forEach(rawQuery => {
+    const query = rawQuery.trim();
+    if (!query) return;
+    const isPmidQuery = /^\d{4,}$/.test(query);
+    let hit;
+    if (isPmidQuery) {
+      hit = allRows.filter(r => r.pmid === query);
+    } else {
+      const qLower = query.toLowerCase();
+      hit = allRows.filter(r => {
+        const tLower = r.title.toLowerCase();
+        return tLower.includes(qLower) || qLower.includes(tLower);
+      });
+    }
+    if (!hit.length) {
+      unmatchedQueries.push(query);
+      return;
+    }
+    hit.forEach(r => matchedByRowIndex.set(r.rowIndex, r));
+  });
+
+  return { items: Array.from(matchedByRowIndex.values()), unmatchedQueries };
 }
 
 // ══════════════════════════════════
@@ -799,6 +886,7 @@ function handleFile(file) {
       AdvancedSettings.show();
       if (startFromRow) startFromRow.style.display = "flex";
       if (stopAfterRow) stopAfterRow.style.display = "flex";
+      if (testDownloadSection) testDownloadSection.style.display = "flex";
       startBtn.disabled = targets.length === 0;
       appendLog(`✅ Excel 解析完成：${targets.length} 篇目標論文（${modeText}）`, "ok");
       statusText.textContent = `已載入 ${targets.length} 篇論文，可開始下載`;
@@ -859,6 +947,59 @@ document.querySelectorAll("input[name='filterMode']").forEach(input => {
 // 按鈕事件
 // ══════════════════════════════════
 
+// 共用啟動邏輯：一般下載與測試下載都走這裡，只有 targetsList 跟 testMode 不同
+function launchDownload(targetsList, { testMode = false } = {}) {
+  if (!targetsList.length) return;
+  const politeMode = politeModeInput?.checked || false;
+  const selectedConcurrent = parseInt(concurrentSelect.value);
+  const concurrent = politeMode ? Math.min(selectedConcurrent || 1, 2) : selectedConcurrent;
+  const downloadFolder = sanitizeDownloadFolder(downloadFolderInput?.value || getDefaultDownloadFolder());
+  const batchSize   = Math.max(0, parseInt(batchSizeInput?.value || "0", 10) || 0);
+  const stopAfter   = Math.max(0, parseInt(stopAfterInput?.value  || "0", 10) || 0);
+  // 記憶資料夾名稱（API 憑證由 api_settings.js 隨輸入即時儲存）
+  chrome.storage.local.set({ downloadFolder });
+  resultsMap = {}; resultsFailMap = {};
+  sessionUpdatedRows = new Set();
+  // 清除 Worker log tab（重新開始）
+  logTabWorkers.innerHTML = "";
+  logTabMore.innerHTML = "<option value=''>更多 Worker ▼</option>";
+  logTabMore.style.display = "none";
+  document.querySelectorAll(".log-wrap:not(#logWrap-global)").forEach(el => el.remove());
+  Object.keys(workerAnchorMap).forEach(k => delete workerAnchorMap[k]);
+  Object.keys(rowAnchorMap).forEach(k => delete rowAnchorMap[k]);
+  workerLogCount = 0;
+  switchLogTab(-1);
+  // Excel 寫入由 background 負責
+
+  startBtn.disabled  = true;
+  pauseBtn.disabled  = false;
+  stopBtn.disabled   = false;
+  statusText.textContent = testMode ? "⚙ 測試下載啟動中..." : "⚙ 啟動中...";
+
+  chrome.runtime.sendMessage({
+    action:     "START_DOWNLOAD",
+    targets:    targetsList,
+    concurrent,
+    downloadFolder,
+    batchSize,
+    politeMode,
+    stopAfter,
+    manualVerifyPause: manualVerifyPauseInput?.checked !== false,
+    preVerifyElsevier: preVerifyInput?.checked === true,
+    publisherApiCreds: AdvancedSettings.getCreds(),
+    testMode,
+  }, res => {
+    if (!res?.ok) {
+      appendLog(`❌ 啟動失敗：${res?.error}`, "fail");
+      startBtn.disabled = false;
+    } else {
+      appendLog(testMode
+        ? `🧪 測試下載已在背景啟動（共 ${targetsList.length} 篇，忽略下載狀況與篩選）`
+        : "🚀 下載已在背景啟動，可自由切換分頁", "info");
+    }
+  });
+}
+
 // 開始
 startBtn.addEventListener("click", () => {
   if (cachedArrayBuffer) {
@@ -874,52 +1015,46 @@ startBtn.addEventListener("click", () => {
     const modeText = filterModeText(filterMode);
     fileInfo.textContent = `📎 ${originalFilename} | 找到 ${targets.length} 篇（${modeText}）`;
   }
-  if (!targets.length) return;
-  const politeMode = politeModeInput?.checked || false;
-  const selectedConcurrent = parseInt(concurrentSelect.value);
-  const concurrent = politeMode ? Math.min(selectedConcurrent || 1, 2) : selectedConcurrent;
-  const downloadFolder = sanitizeDownloadFolder(downloadFolderInput?.value || getDefaultDownloadFolder());
-  const batchSize   = Math.max(0, parseInt(batchSizeInput?.value || "0", 10) || 0);
-  const stopAfter   = Math.max(0, parseInt(stopAfterInput?.value  || "0", 10) || 0);
-  // 記憶資料夾名稱（API 憑證由 api_settings.js 隨輸入即時儲存）
-  chrome.storage.local.set({ downloadFolder });
-  resultsMap = {}; resultsFailMap = {};
-  sessionUpdatedRows = new Set();
-  // 清除 Worker log tab（重新開始）
-  logTabWorkers.innerHTML = "";
-  logTabMore.innerHTML = "<option value=''>\u66f4\u591a Worker \u25bc</option>";
-  logTabMore.style.display = "none";
-  document.querySelectorAll(".log-wrap:not(#logWrap-global)").forEach(el => el.remove());
-  Object.keys(workerAnchorMap).forEach(k => delete workerAnchorMap[k]);
-  Object.keys(rowAnchorMap).forEach(k => delete rowAnchorMap[k]);
-  workerLogCount = 0;
-  switchLogTab(-1);
-  // Excel 寫入由 background 負責
+  launchDownload(targets, { testMode: false });
+});
 
-  startBtn.disabled  = true;
-  pauseBtn.disabled  = false;
-  stopBtn.disabled   = false;
-  statusText.textContent = "⚙ 啟動中...";
+// 測試下載（Debug 用）：依指定的 PMID/Title 強制下載，忽略下載狀況與 Column M 篩選
+testDownloadBtn?.addEventListener("click", () => {
+  if (!cachedArrayBuffer) { alert("請先上傳 Excel。"); return; }
+  const queryLines = (testDownloadInput?.value || "").split("\n").map(s => s.trim()).filter(Boolean);
+  if (!queryLines.length) { alert("請輸入至少一個 PMID 或 Title（每行一個）。"); return; }
 
-  chrome.runtime.sendMessage({
-    action:     "START_DOWNLOAD",
-    targets,
-    concurrent,
-    downloadFolder,
-    batchSize,
-    politeMode,
-    stopAfter,
-    manualVerifyPause: manualVerifyPauseInput?.checked !== false,
-    preVerifyElsevier: preVerifyInput?.checked === true,
-    publisherApiCreds: AdvancedSettings.getCreds(),
-  }, res => {
-    if (!res?.ok) {
-      appendLog(`❌ 啟動失敗：${res?.error}`, "fail");
-      startBtn.disabled = false;
-    } else {
-      appendLog("🚀 下載已在背景啟動，可自由切換分頁", "info");
-    }
-  });
+  let parsed;
+  try {
+    parsed = parseExcelForTest(cachedArrayBuffer, queryLines);
+  } catch (e) {
+    alert("解析失敗：" + e.message);
+    return;
+  }
+
+  const { items, unmatchedQueries } = parsed;
+  if (!items.length) {
+    if (testDownloadMatchInfo) testDownloadMatchInfo.textContent = "⚠ 找不到符合的文獻";
+    alert("找不到符合指定 PMID/Title 的文獻，請確認輸入是否正確。");
+    return;
+  }
+
+  const shortTitle = t => (t.length > 40 ? t.slice(0, 40) + "…" : t);
+  const summary = items.map(it => `PMID ${it.pmid || "-"}｜${shortTitle(it.title)}`).join("\n");
+  const unmatchedNote = unmatchedQueries.length
+    ? `\n\n⚠ 以下查詢沒有找到符合的文獻：\n${unmatchedQueries.join("\n")}`
+    : "";
+  if (!confirm(`即將測試下載 ${items.length} 篇（忽略下載狀況、Storage 完成紀錄與 Column M 篩選）：\n\n${summary}${unmatchedNote}\n\n確定要開始嗎？`)) return;
+
+  if (testDownloadMatchInfo) {
+    testDownloadMatchInfo.textContent = `✅ 已匹配 ${items.length} 篇` +
+      (unmatchedQueries.length ? `，${unmatchedQueries.length} 筆查詢未匹配` : "");
+  }
+  appendLog(`🧪 測試下載：匹配到 ${items.length} 篇 → ${items.map(it => it.pmid || shortTitle(it.title)).join(", ")}`, "warn");
+  if (unmatchedQueries.length) {
+    appendLog(`⚠ 測試下載：${unmatchedQueries.length} 筆查詢沒有匹配到文獻：${unmatchedQueries.join(" | ")}`, "warn");
+  }
+  launchDownload(items, { testMode: true });
 });
 
 // 暫停
@@ -1005,6 +1140,9 @@ clearBtn.addEventListener("click", () => {
   if (verifySection)    verifySection.style.display    = "none";
   if (startFromRow)     startFromRow.style.display     = "none";
   if (stopAfterRow)     stopAfterRow.style.display     = "none";
+  if (testDownloadSection) testDownloadSection.style.display = "none";
+  if (testDownloadInput)   testDownloadInput.value = "";
+  if (testDownloadMatchInfo) testDownloadMatchInfo.textContent = "";
   if (resultDetailPanel) resultDetailPanel.style.display = "none";
   if (progressTablePanel) progressTablePanel.style.display = "none";
   if (progressTableBtn)   progressTableBtn.style.display   = "none";
