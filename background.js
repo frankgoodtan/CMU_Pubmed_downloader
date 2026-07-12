@@ -1104,33 +1104,35 @@ async function _buildAndSaveExcel({ toDownload = false } = {}) {
     addThreadLog("_buildAndSaveExcel: 新增「失敗原因」欄（全新檔案）", { col: failReasonCol });
   }
 
-  const YELLOW  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
-  const ORANGE  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFA500" } };
-  const AMBER   = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFCC99" } };
-  const NO_FILL = { type: "pattern", pattern: "none" };
+  // 框框填色＝「這次有處理過」的高亮記號（跟狀態無關，一律黃色）；
+  // 文字顏色＝狀態本身，是持續累積的紀錄，不會被下一輪清掉。
+  const YELLOW    = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF00" } };
+  const NO_FILL   = { type: "pattern", pattern: "none" };
+  const FONT_BLACK = "FF000000"; // 下載成功
+  const FONT_RED   = "FFFF0000"; // 下載失敗
+  const FONT_BLUE  = "FF0000FF"; // 下次重試
 
   const rMap     = G.resultsMap     || {};
   const failMap  = G.resultsFailMap || {};
-  const sessionRows = new Set(Object.keys(rMap).map(Number));
 
- 
+  // 上一輪處理留下的黃色高亮先整欄清掉（不管當時是什麼狀態，反正黃色只代表
+  // 「上次有動過」），文字顏色不動——那是用來看所有列目前狀態的持續紀錄。
   ws.eachRow((row, rowNumber) => {
     if (rowNumber === 1) return;
-    const cell = row.getCell(statusCol);
-    const argb = (cell.fill?.fgColor?.argb || "").toUpperCase();
-    if (argb === "FFFFFF00") cell.fill = NO_FILL;
+    row.getCell(statusCol).fill = NO_FILL;
   });
 
- 
   for (const [rowIndex, status] of Object.entries(rMap)) {
     const ri  = parseInt(rowIndex, 10);
     const row = ws.getRow(ri);
     const cell = row.getCell(statusCol);
     cell.value = status;
-    cell.fill  = status === STATUS_SUCCESS ? YELLOW
-               : status === STATUS_FAIL ? ORANGE
-               : status === STATUS_RETRY ? AMBER
-               : NO_FILL;
+    cell.fill  = YELLOW; // 本次處理過的列都標黃，代表「這次有動過」
+    const fontColor = status === STATUS_SUCCESS ? FONT_BLACK
+                     : status === STATUS_FAIL ? FONT_RED
+                     : status === STATUS_RETRY ? FONT_BLUE
+                     : FONT_BLACK;
+    cell.font = { ...(cell.font || {}), color: { argb: fontColor } };
     const failCell = row.getCell(failReasonCol);
     if ((status === STATUS_FAIL || status === STATUS_RETRY) && failMap[ri]) {
       failCell.value = failMap[ri];
