@@ -209,6 +209,76 @@
     .settings-row button:hover { background: #e2e8f0; }
     .settings-row .delay-note { font-size: 10px; color: #999; }
     .stat-box { cursor: pointer; }
+
+    /* ── 本地資料夾核對差異報告（overlay modal）── */
+    .diff-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(15,23,42,0.55);
+      z-index: 1000; align-items: center; justify-content: center; padding: 16px;
+    }
+    .diff-overlay.show { display: flex; }
+    .diff-panel {
+      background: #fff; border-radius: 8px; width: 100%; max-width: 480px;
+      max-height: 90vh; display: flex; flex-direction: column;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+    .diff-panel-header {
+      padding: 12px 14px; border-bottom: 1px solid #e5e7eb;
+      background: #eef2ff; border-radius: 8px 8px 0 0;
+    }
+    .diff-panel-header strong { color: #3730a3; font-size: 13px; display: block; }
+    .diff-summary-line { font-size: 11px; color: #4338ca; }
+    .diff-panel-body { padding: 10px 14px; overflow-y: auto; flex: 1; }
+    .diff-section { margin-bottom: 12px; }
+    .diff-section:last-child { margin-bottom: 0; }
+    .diff-section.empty { display: none; }
+    .diff-section-title { font-weight: 700; font-size: 12px; margin-bottom: 4px; color: #374151; }
+    .diff-list { font-size: 11px; }
+    .diff-row {
+      padding: 6px 8px; border: 1px solid #e5e7eb; border-radius: 4px;
+      margin-bottom: 4px; background: #f9fafb; line-height: 1.5;
+    }
+    .diff-row.mismatch { border-color: #fbbf24; background: #fffbeb; }
+    .diff-row.conflict { border-color: #f87171; background: #fef2f2; }
+    .diff-row.anomaly  { border-color: #93c5fd; background: #eff6ff; }
+    .diff-panel-footer {
+      padding: 10px 14px; border-top: 1px solid #e5e7eb; display: flex;
+      gap: 8px; justify-content: flex-end;
+    }
+    .diff-btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; cursor: pointer; font-family: inherit; }
+    .diff-btn-cancel { background: #fff; border: 1px solid #ccc; color: #374151; }
+    .diff-btn-apply { background: #16a34a; border: none; color: #fff; font-weight: 700; }
+
+    /* ── 本地資料夾模式：同一排的按鈕等寬（用 flex:1 而不是固定 px，適應容器寬度）── */
+    .lf-btn-row { display: flex; gap: 6px; }
+    .lf-btn-equal {
+      flex: 1; min-width: 0; text-align: center; white-space: normal; line-height: 1.3;
+      padding: 6px 6px;
+    }
+
+    /* ── 本地資料夾模式：操作說明提示 modal（第一次點按鈕時跳出）── */
+    .tip-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(15,23,42,0.55);
+      z-index: 1000; align-items: center; justify-content: center; padding: 16px;
+    }
+    .tip-overlay.show { display: flex; }
+    .tip-panel {
+      background: #fff; border-radius: 8px; width: 100%; max-width: 380px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+    .tip-panel-header {
+      padding: 12px 14px; border-bottom: 1px solid #e5e7eb;
+      background: #eef2ff; border-radius: 8px 8px 0 0;
+    }
+    .tip-panel-header strong { color: #3730a3; font-size: 13px; }
+    .tip-panel-body { padding: 12px 14px; font-size: 12px; color: #374151; line-height: 1.7; }
+    .tip-checkbox-row {
+      display: flex; align-items: flex-start; gap: 6px; padding: 0 14px 12px;
+      font-size: 11px; color: #6b7280; cursor: pointer;
+    }
+    .tip-panel-footer {
+      padding: 10px 14px; border-top: 1px solid #e5e7eb; display: flex;
+      justify-content: flex-end;
+    }
   </style>
 </head>
 <body>
@@ -275,6 +345,7 @@
       已開啟驗證分頁，請在該分頁完成驗證（例如勾選「我是真人」方塊）。<br>
       通過後會自動偵測並繼續下載；若沒有自動繼續，再按下方按鈕。
     </div>
+    <div id="verifyQueueNote" style="display:none; font-size:11px; color:#b91c1c; font-weight:700; margin:4px 0;"></div>
     <div id="verifyUrlNote" style="font-size:10px; color:#999; margin:6px 0; word-break:break-all;"></div>
     <button id="verifyDoneBtn"
       style="width:100%; padding:8px; border:none; border-radius:6px; background:#16a34a; color:#fff; font-size:13px; font-weight:700; cursor:pointer;">
@@ -292,8 +363,43 @@
     </div>
   </div>
 
-  <!-- 上傳區 -->
-  <div class="upload-area" id="uploadArea">
+  <!-- 本地資料夾模式：一份 Excel 對應一個專屬資料夾，PDF/失敗筆記/進度 Excel 都寫
+       到這個資料夾，不受限於 Chrome 預設下載資料夾。這裡永遠顯示（不像下面的上傳區
+       要等上傳完才出現其他設定），因為選專案資料夾本身就是這個模式的第一步。 -->
+  <div id="localFolderSection" style="background:#eef2ff; border-bottom:1px solid #c7d2fe; padding:8px 14px;">
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; font-weight:700; color:#3730a3;">
+      <input type="checkbox" id="localFolderModeInput" checked>
+      <span>📁 本地資料夾模式（預設啟用，取代 Chrome 下載 API；PDF／進度 Excel 存到自選資料夾）</span>
+    </label>
+    <div id="localFolderControls" style="margin-top:6px; display:flex; flex-direction:column; gap:6px;">
+      <input type="text" id="localFolderRootInput" readonly placeholder="尚未選擇專案資料夾"
+        style="width:100%; box-sizing:border-box; padding:5px 8px; border:1px solid #c7d2fe; border-radius:4px; font-size:12px; background:#fff;">
+      <div class="lf-btn-row">
+        <button type="button" id="localFolderNewProjectBtn" title="新建或選一個空資料夾，接著上傳原始 Excel 建立新專案"
+          class="lf-btn-equal"
+          style="border:1px solid #6366f1; border-radius:4px; background:#6366f1; color:#fff; font-size:12px; cursor:pointer;">🆕 建立並選取全新專案資料夾</button>
+        <button type="button" id="localFolderResumeProjectBtn" title="選擇已經建立過的專案資料夾，自動讀取裡面的進度管理 Excel 接續"
+          class="lf-btn-equal"
+          style="border:1px solid #6366f1; border-radius:4px; background:#6366f1; color:#fff; font-size:12px; cursor:pointer;">📂 選取已存在專案資料夾</button>
+      </div>
+      <div class="lf-btn-row">
+        <button type="button" id="localFolderReconcileBtn"
+          class="lf-btn-equal"
+          style="border:1px solid #6366f1; border-radius:4px; background:#fff; color:#6366f1; font-size:12px; cursor:pointer;">🔄 核對進度</button>
+        <button type="button" id="localFolderUpdateListBtn" title="上傳一份新的 Excel，只把裡面沒出現過的新論文（依 PMID／標題比對）加進目前專案，不會動到既有進度"
+          class="lf-btn-equal"
+          style="border:1px solid #6366f1; border-radius:4px; background:#fff; color:#6366f1; font-size:12px; cursor:pointer;">📋 更新論文清單</button>
+      </div>
+      <input type="file" id="updateExcelFileInput" accept=".xlsx" style="display:none;">
+    </div>
+    <div id="localFolderSummary" style="font-size:11px; color:#4338ca; margin-top:4px;"></div>
+  </div>
+
+  <!-- 上傳區：預設隱藏。傳統模式（本地資料夾模式關閉）或「🆕 建立並選取全新專案
+       資料夾」選到空資料夾後，才由 popup.js 的 setUploadAreaVisible() 顯示出來——
+       其他情況（核對進度、更新論文清單、接續已存在專案）都不需要／不應該再讓使用者
+       看到這個入口，見 popup.js 的 resetLoadedExcelState() 說明。 -->
+  <div class="upload-area" id="uploadArea" style="display:none;">
     <div class="icon">📂</div>
     <p><strong>點擊</strong>或拖曳上傳 Excel 檔案（.xlsx）</p>
     <p style="margin-top:3px; font-size:11px;">Column M = Y 者自動加入下載清單</p>
@@ -331,13 +437,6 @@
     <span class="delay-note">每篇間隔 2-4 秒隨機延遲</span>
   </div>
 
-  <!-- 下載資料夾 -->
-  <div class="settings-row" id="folderRow">
-    <label>下載資料夾</label>
-    <input type="text" id="downloadFolderInput" class="wide-input" value="" placeholder="例如 PubMed_PDFs/子資料夾">
-    <button type="button" id="openDownloadSettingsBtn">下載設定</button>
-    <span class="delay-note">位於 Chrome 預設下載資料夾內</span>
-  </div>
   <div class="settings-row" id="batchRow">
     <label>批次資料夾</label>
     <input type="number" id="batchSizeInput" min="0" value="0" placeholder="例如 20">
@@ -367,6 +466,48 @@
       <span>開始前用測試文章探測 ScienceDirect 驗證（不下載檔案）</span>
     </label>
 
+    <div style="margin-top:10px;">
+      <label style="display:block; font-size:12px; color:#334155; margin-bottom:4px;">
+        畫愛心要定位的驗證挑戰元件
+      </label>
+      <select id="challengeSelectorPreset" style="width:100%; font-size:12px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; margin-bottom:4px; box-sizing:border-box;">
+        <option value="">預設（全部常見類型都認）</option>
+        <option value=".g-recaptcha">Google reCAPTCHA（.g-recaptcha）</option>
+        <option value=".cf-turnstile">Cloudflare Turnstile（.cf-turnstile）</option>
+        <option value="#px-captcha">PerimeterX（#px-captcha）</option>
+        <option value="#challenge-form, #cf-challenge-running">Cloudflare Challenge Form</option>
+        <option value="iframe[src*='recaptcha']">reCAPTCHA iframe</option>
+        <option value="iframe[src*='turnstile']">Turnstile iframe</option>
+        <option value="iframe[src*='hcaptcha']">hCaptcha iframe</option>
+        <option value="__custom__">自訂 CSS selector…</option>
+      </select>
+      <input type="text" id="challengeSelectorCustom" placeholder="例如：.my-captcha-widget" style="display:none; width:100%; box-sizing:border-box; font-size:12px; padding:4px 6px; border:1px solid #ccc; border-radius:4px;">
+      <span class="delay-note">只影響畫愛心要定位哪個元件，不影響「有沒有偵測到人機驗證」本身的判斷</span>
+    </div>
+
+    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">📁 本地資料夾模式</div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
+      <input type="checkbox" id="allowChromeDownloadsFallbackInput">
+      <span>本地資料夾模式寫檔失敗時，允許退回 Chrome 原生下載（存進 Chrome 下載資料夾）</span>
+    </label>
+    <span class="delay-note">預設關閉：失敗就直接判定該篇失敗，逼你先修好 native host 安裝，不會悄悄存錯地方</span>
+
+    <div style="margin-top:10px;">
+      <button type="button" id="lfTipResetBtn"
+        style="padding:4px 10px; border:1px solid #6366f1; border-radius:4px; background:#fff; color:#6366f1; font-size:12px; cursor:pointer;">
+        🔄 重新顯示本地資料夾模式的操作說明提示
+      </button>
+      <span class="delay-note">四顆按鈕（建立全新專案／選取已存在專案／核對進度／更新論文清單）勾過「知道了下次不顯示」的說明，按這裡可以全部恢復顯示</span>
+    </div>
+
+    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">☁ Chrome 下載 API 設定（本地資料夾模式關閉時才會用到）</div>
+    <div class="settings-row" id="folderRow" style="padding:0 0 4px;">
+      <label>下載資料夾</label>
+      <input type="text" id="downloadFolderInput" class="wide-input" value="" placeholder="例如 PubMed_PDFs/子資料夾">
+      <button type="button" id="openDownloadSettingsBtn">下載設定</button>
+      <span class="delay-note">位於 Chrome 預設下載資料夾內</span>
+    </div>
+
     <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">🔑 出版商官方 API（有填就優先走 API 下載，不經出版社網頁、不會遇人機驗證）</div>
     <!-- 各出版商憑證欄位由 api_settings.js 依 publisher_apis.js 的註冊表自動產生 -->
     <div id="publisherApiFields"></div>
@@ -377,18 +518,29 @@
   </div>
   <div class="settings-row" id="stopAfterRow">
     <label>處理後停止</label>
-    <input type="number" id="stopAfterInput" min="0" value="0" placeholder="例如 100" style="width:70px;">
-    <span class="delay-note">0 = 不限制；設 n 時，完成 n 篇（成功＋失敗均計）後自動停止</span>
+    <input type="number" id="stopAfterInput" min="0" value="200" placeholder="例如 100" style="width:70px;">
+    <span class="delay-note">0 = 不限制；設 n 時，完成 n 篇（成功＋失敗均計）後自動停止（保守模式預設 200）</span>
   </div>
 
-  <!-- 測試下載區塊（Debug 用，獨立於一般下載流程） -->
-  <div id="testDownloadSection" style="display:none; flex-direction:column; align-items:stretch; gap:6px; background:#fff7ed; border:1px dashed #f59e0b; border-radius:6px; margin:8px 10px; padding:8px 10px;">
-    <div style="font-weight:700; font-size:12px; color:#92400e;">🧪 測試下載（Debug 用）</div>
-    <div style="font-size:11px; color:#92400e;">貼上 PMID 或 Title（每行一個）；會忽略下載狀況、Storage 完成紀錄與 Column M 篩選，直接強制下載指定文獻。</div>
-    <textarea id="testDownloadInput" rows="3" placeholder="例如：&#10;39658376&#10;Acupuncture for the prevention of..." style="font-size:12px; font-family:inherit; padding:6px; border:1px solid #fbbf24; border-radius:4px; resize:vertical;"></textarea>
-    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-      <button type="button" id="testDownloadBtn" style="background:#f59e0b; color:#fff; border:none; border-radius:4px; padding:5px 12px; font-size:12px; cursor:pointer;">🧪 測試下載指定文獻</button>
-      <span class="delay-note" id="testDownloadMatchInfo"></span>
+  <!-- 測試工具（Debug 用，統一收合；預設不觸發任何動作，按下小按鈕才展開） -->
+  <div class="settings-row" id="testToolsRow">
+    <button type="button" id="testToolsToggleBtn">🧪 測試工具</button>
+    <span class="delay-note" id="testToolsSummary">測試下載指定文獻／模擬人機驗證流程</span>
+  </div>
+  <div id="testToolsPanel" style="display:none; flex-direction:column; align-items:stretch; gap:10px; background:#fff7ed; border:1px dashed #f59e0b; border-radius:6px; margin:8px 10px; padding:8px 10px;">
+    <div>
+      <div style="font-weight:700; font-size:12px; color:#92400e; margin-bottom:4px;">📄 測試下載指定文獻</div>
+      <div style="font-size:11px; color:#92400e; margin-bottom:6px;">貼上 PMID 或 Title（每行一個）；會忽略下載狀況、Storage 完成紀錄與 Column M 篩選，直接強制下載指定文獻。</div>
+      <textarea id="testDownloadInput" rows="3" placeholder="例如：&#10;39658376&#10;Acupuncture for the prevention of..." style="width:100%; box-sizing:border-box; font-size:12px; font-family:inherit; padding:6px; border:1px solid #fbbf24; border-radius:4px; resize:vertical;"></textarea>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+        <button type="button" id="testDownloadBtn" style="background:#f59e0b; color:#fff; border:none; border-radius:4px; padding:5px 12px; font-size:12px; cursor:pointer;">🧪 測試下載指定文獻</button>
+        <span class="delay-note" id="testDownloadMatchInfo"></span>
+      </div>
+    </div>
+    <div style="border-top:1px dashed #f59e0b; padding-top:10px;">
+      <div style="font-weight:700; font-size:12px; color:#92400e; margin-bottom:4px;">🤖 模擬人機驗證流程</div>
+      <div style="font-size:11px; color:#92400e; margin-bottom:6px;">開一個空白分頁模擬「偵測到人機驗證」的畫面與排隊流程，不會連到真實驗證頁。</div>
+      <button type="button" id="testVerifyBtn" style="background:#f59e0b; color:#fff; border:none; border-radius:4px; padding:5px 12px; font-size:12px; cursor:pointer;">🧪 測試人機驗證流程</button>
     </div>
   </div>
 
@@ -514,6 +666,51 @@
   <div class="status-bar">
     <span id="statusText">請上傳 Excel 檔案</span>
     <span class="shortcut-hint">Alt+S = 暫停/繼續</span>
+  </div>
+
+  <!-- 本地資料夾模式：核對差異報告（預設隱藏，由 showLocalFolderDiffModal() 控制）-->
+  <div id="localDiffOverlay" class="diff-overlay">
+    <div class="diff-panel">
+      <div class="diff-panel-header">
+        <strong>🔍 本地資料夾核對報告</strong>
+        <span id="diffSummaryLine" class="diff-summary-line"></span>
+      </div>
+      <div class="diff-panel-body">
+        <div id="diffMismatchSection" class="diff-section">
+          <div class="diff-section-title">⚠ 狀態不一致</div>
+          <div id="diffMismatchList" class="diff-list"></div>
+        </div>
+        <div id="diffConflictSection" class="diff-section">
+          <div class="diff-section-title">⚡ 衝突（成功 PDF 與失敗/重試紀錄同時存在）</div>
+          <div id="diffConflictList" class="diff-list"></div>
+        </div>
+        <div id="diffAnomalySection" class="diff-section">
+          <div class="diff-section-title">❓ 異常檔案（僅列出供你自行確認，同步時不會自動處理）</div>
+          <div id="diffAnomalyList" class="diff-list"></div>
+        </div>
+      </div>
+      <div class="diff-panel-footer">
+        <button type="button" id="diffCancelBtn" class="diff-btn diff-btn-cancel">取消</button>
+        <button type="button" id="diffApplyBtn" class="diff-btn diff-btn-apply">✅ 同步更新</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 本地資料夾模式：四顆操作按鈕第一次點擊時的說明提示（預設隱藏，由
+       showLfTipThen() 控制；勾選「知道了下次不顯示」後存進 storage，之後可在
+       進階設定的「📁 本地資料夾模式」區用「🔄 重新顯示操作說明提示」恢復）-->
+  <div id="lfTipOverlay" class="tip-overlay">
+    <div class="tip-panel">
+      <div class="tip-panel-header"><strong id="lfTipTitle"></strong></div>
+      <div class="tip-panel-body" id="lfTipBody"></div>
+      <label class="tip-checkbox-row">
+        <input type="checkbox" id="lfTipDontShowAgain">
+        <span>知道了，下次不顯示（之後可在「⚙ 驗證與 API 進階設定 → 📁 本地資料夾模式」重新開啟）</span>
+      </label>
+      <div class="tip-panel-footer">
+        <button type="button" id="lfTipContinueBtn" class="diff-btn diff-btn-apply">繼續</button>
+      </div>
+    </div>
   </div>
 
   <script src="publisher_apis.js"></script>

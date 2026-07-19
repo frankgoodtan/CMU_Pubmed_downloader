@@ -1,0 +1,22 @@
+{
+  "ok": true,
+  "samples": 24,
+  "durationMs": 376.0,
+  "totalDistancePx": 43.7,
+  "displacementPx": 43.2,
+  "straightnessRatio": 0.987,
+  "averageIntervalMs": 16.35,
+  "p95IntervalMs": 21.13,
+  "averageSpeedPxPerMs": 0.1191,
+  "peakSpeedPxPerMs": 0.3203,
+  "p95SpeedPxPerMs": 0.2542,
+  "pauseRatio": 0.217,
+  "averageAbsAcceleration": 0.00439,
+  "p95AbsAcceleration": 0.00847,
+  "averageAngleChangeDeg": 8.42,
+  "p95AngleChangeDeg": 26.57,
+  "clickCount": 1,
+  "clickTimesMs": [
+    321.6
+  ]
+}

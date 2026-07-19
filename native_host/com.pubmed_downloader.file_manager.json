@@ -1,0 +1,9 @@
+﻿{
+    "name":  "com.pubmed_downloader.file_manager",
+    "description":  "PubMed PDF Downloader - local folder mode file manager",
+    "path":  "C:\\Users\\user\\Desktop\\自動載pubmed論文擴充\\pubmed_pdf_downloader_v6.9c\\pubmed_pdf_downloader_v6.9c\\chrome_extension\\native_host\\python_file_manager.bat",
+    "type":  "stdio",
+    "allowed_origins":  [
+                            "chrome-extension://ngkjkkofhbbemmjobfifbifigkijbpbo/"
+                        ]
+}

@@ -21,8 +21,23 @@ const AdvancedSettings = (() => {
   const fieldsHost = document.getElementById("publisherApiFields");
   const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
   const preVerifyInput         = document.getElementById("preVerifyInput");
+  const challengeSelectorPreset = document.getElementById("challengeSelectorPreset");
+  const challengeSelectorCustom = document.getElementById("challengeSelectorCustom");
+  const allowChromeDownloadsFallbackInput = document.getElementById("allowChromeDownloadsFallbackInput");
 
   const inputs = {}; // publisherId → { fieldKey → <input> }
+
+  function getChallengeSelector() {
+    if (challengeSelectorPreset?.value === "__custom__") {
+      return (challengeSelectorCustom?.value || "").trim();
+    }
+    return challengeSelectorPreset?.value || "";
+  }
+
+  function toggleChallengeSelectorCustomInput() {
+    if (!challengeSelectorCustom) return;
+    challengeSelectorCustom.style.display = challengeSelectorPreset?.value === "__custom__" ? "block" : "none";
+  }
 
   function buildFields() {
     if (!fieldsHost) return;
@@ -65,24 +80,45 @@ const AdvancedSettings = (() => {
   }
 
   function save() {
-    chrome.storage.local.set({ publisherApiCreds: getCreds() });
+    chrome.storage.local.set({
+      publisherApiCreds: getCreds(),
+      manualVerificationChallengeSelector: getChallengeSelector(),
+      allowChromeDownloadsFallback: !!allowChromeDownloadsFallbackInput?.checked
+    });
   }
 
   function load() {
-    chrome.storage.local.get(["publisherApiCreds", "elsevierApiKey", "elsevierInsttoken"], d => {
-      const creds = d.publisherApiCreds || {};
-      // 相容舊版儲存格式（曾以 elsevierApiKey / elsevierInsttoken 各存一鍵）
-      if (!creds.elsevier && (d.elsevierApiKey || d.elsevierInsttoken)) {
-        creds.elsevier = { apiKey: d.elsevierApiKey || "", insttoken: d.elsevierInsttoken || "" };
-      }
-      for (const pub of PUBLISHER_APIS) {
-        for (const f of pub.fields) {
-          const v = creds?.[pub.id]?.[f.key];
-          if (v && inputs[pub.id]?.[f.key]) inputs[pub.id][f.key].value = v;
+    chrome.storage.local.get(
+      ["publisherApiCreds", "elsevierApiKey", "elsevierInsttoken", "manualVerificationChallengeSelector", "allowChromeDownloadsFallback"],
+      d => {
+        if (allowChromeDownloadsFallbackInput) allowChromeDownloadsFallbackInput.checked = !!d.allowChromeDownloadsFallback;
+        const creds = d.publisherApiCreds || {};
+        // 相容舊版儲存格式（曾以 elsevierApiKey / elsevierInsttoken 各存一鍵）
+        if (!creds.elsevier && (d.elsevierApiKey || d.elsevierInsttoken)) {
+          creds.elsevier = { apiKey: d.elsevierApiKey || "", insttoken: d.elsevierInsttoken || "" };
         }
+        for (const pub of PUBLISHER_APIS) {
+          for (const f of pub.fields) {
+            const v = creds?.[pub.id]?.[f.key];
+            if (v && inputs[pub.id]?.[f.key]) inputs[pub.id][f.key].value = v;
+          }
+        }
+
+        const savedSelector = d.manualVerificationChallengeSelector || "";
+        if (challengeSelectorPreset) {
+          const knownValues = Array.from(challengeSelectorPreset.options).map(o => o.value);
+          if (savedSelector && !knownValues.includes(savedSelector)) {
+            challengeSelectorPreset.value = "__custom__";
+            if (challengeSelectorCustom) challengeSelectorCustom.value = savedSelector;
+          } else {
+            challengeSelectorPreset.value = savedSelector;
+          }
+          toggleChallengeSelectorCustomInput();
+        }
+
+        updateSummary();
       }
-      updateSummary();
-    });
+    );
   }
 
   function updateSummary() {
@@ -92,6 +128,7 @@ const AdvancedSettings = (() => {
     parts.push("SD 預熱：" + (preVerifyInput?.checked ? "開" : "關"));
     const configured = publisherApiConfiguredLabels(getCreds());
     parts.push("API：" + (configured.length ? configured.join("+") : "未設定"));
+    parts.push("失敗退回 Chrome 下載：" + (allowChromeDownloadsFallbackInput?.checked ? "開" : "關"));
     summary.textContent = parts.join("｜");
   }
 
@@ -119,6 +156,13 @@ const AdvancedSettings = (() => {
   [manualVerifyPauseInput, preVerifyInput].forEach(el => {
     el?.addEventListener("change", updateSummary);
   });
+  allowChromeDownloadsFallbackInput?.addEventListener("change", () => { save(); updateSummary(); });
+  challengeSelectorPreset?.addEventListener("change", () => {
+    toggleChallengeSelectorCustomInput();
+    save();
+    updateSummary();
+  });
+  challengeSelectorCustom?.addEventListener("input", () => { save(); updateSummary(); });
   updateSummary();
 
   return { getCreds, show, hide, updateSummary };

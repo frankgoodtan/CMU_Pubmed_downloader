@@ -1,0 +1,125 @@
+====================================================================
+人機驗證畫愛心 — Native Messaging Host 安裝說明
+====================================================================
+
+用途：
+  PubMed PDF 批次下載器擴充功能偵測到人機驗證時，除了把驗證分頁切到
+  最前景，還會呼叫這個資料夾裡的 python_write_love.bat 畫一個愛心
+  當提醒動畫。這需要 Chrome 的 Native Messaging 機制，必須先在本機
+  的 Windows 登錄檔（HKCU，僅影響目前使用者帳號）註冊一次，換到
+  別台電腦、或同一台電腦重灌 Chrome 後都要重新做一次這個安裝。
+
+前置需求：
+  - 這台電腦要有裝 Python（命令提示字元打 python --version 或
+    py --version 能看到版本號即可）。
+  - 裝好下面三個套件（python_write_love.py 啟動後會自己掃描螢幕、
+    比對 checkbox_template.png 找目標座標，需要這些套件才能執行）：
+        pip install opencv-python mss numpy
+  - Chrome 已經載入這個擴充功能（未封裝／開發者模式），且已重新整理
+    過，確保用的是含 nativeMessaging 權限的最新版 manifest.json。
+
+安裝步驟：
+
+  1) 取得擴充功能 ID
+     打開 chrome://extensions，找到「PubMed PDF 批次下載器 v6」
+     卡片，卡片上會有一行：
+         ID: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+     （32 碼小寫英文字母）把它複製起來。
+
+  2) 在檔案總管打開 native_host 這個資料夾，點一下網址列（路徑欄）、
+     打 cmd、按 Enter — 會開一個命令提示字元視窗，而且已經站在這個
+     資料夾裡，不用另外打 cd。
+
+     接著直接貼上這一行（把 你的ID 換成剛剛複製的字串，不要加引號、
+     不要加角括號）：
+
+         powershell -ExecutionPolicy Bypass -File install_write_love.ps1 -ExtensionId 你的ID
+
+     例如：
+         powershell -ExecutionPolicy Bypass -File install_write_love.ps1 -ExtensionId ffkadoflggdodoijejjplanpfbofncaa
+
+  3) 看到類似下面的輸出代表安裝成功：
+
+         Installed native messaging host: com.pubmed_downloader.write_love
+           manifest:  ...\com.pubmed_downloader.write_love.json
+           bat:       ...\python_write_love.bat
+           extension: chrome-extension://你的ID/
+
+  4) 回 chrome://extensions 把擴充功能重新整理一次，打開 popup，
+     展開「🧪 測試工具」→ 按「🧪 測試人機驗證流程」測試。
+     成功的話會另外跳出一個畫愛心的小視窗，約 5 秒後自動關閉。
+
+安裝做了什麼（供參考）：
+  - 把 com.pubmed_downloader.write_love.json 這個 manifest 檔案，
+    用這台電腦上的絕對路徑、你的擴充功能 ID 覆寫填好。
+  - 在登錄檔寫入一筆機碼：
+        HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.write_love
+    值指向上面那個 manifest 檔案的絕對路徑。
+  - 只寫 HKCU（目前使用者），不需要系統管理員權限，也不影響其他使用者帳號。
+
+換到新電腦 / 重灌後怎麼辦：
+  - 這個登錄檔機碼不會跟著搬（HKCU 是每台電腦、每個帳號各自獨立），
+    所以只要複製整個 chrome_extension 資料夾到新電腦、載入擴充功能，
+    再照上面 1)～4) 重新跑一次安裝步驟即可，路徑跟 ID 通常都會變，
+    重新執行 install_write_love.ps1 就會自動抓新的路徑重寫 manifest。
+
+解除安裝：
+  同樣在 native_host 資料夾開 cmd（網址列打 cmd），貼上這一行：
+      reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.write_love" /f
+
+疑難排解：
+  - 按了「測試人機驗證流程」完全沒反應、也沒跳出愛心視窗：
+    表示 native host 還沒安裝成功，回到步驟 1)～3) 重跑一次。
+  - 想看詳細錯誤：chrome://extensions 該擴充功能卡片上點「service worker」
+    連結開發者工具，看 Console 有沒有紅字。
+  - python_write_love.bat 找不到 python：在命令提示字元打
+    python --version 或 py --version 能正常顯示版本號；如果都沒有，
+    要先安裝 Python 並確保有加入 PATH。
+  - 跳出 ModuleNotFoundError（cv2 / mss / numpy）：代表前置需求那三個
+    套件沒裝，跑 pip install opencv-python mss numpy 補裝即可。
+
+====================================================================
+本地資料夾模式 — 第二個 Native Messaging Host 安裝說明
+====================================================================
+
+用途：
+  popup 裡「本地資料夾模式」開關打開後，PDF／下載失敗筆記／進度 Excel
+  不再受限於 Chrome 預設下載資料夾，而是寫到你自己選的專案資料夾（例如
+  桌面上的 cancer paper）。這靠另一個 native host——python_file_manager.py
+  ——做實際的檔案讀寫，一樣需要先在本機登錄檔（HKCU）註冊一次，跟上面
+  「畫愛心」那個 host 是彼此獨立的兩個安裝，都裝了本地資料夾模式才會
+  完整可用。
+
+前置需求：
+  - 只需要 Python 本身（stdlib），不需要額外 pip install 任何套件
+    （不像 write_love 需要 opencv-python/mss/numpy，這支只用
+    tkinter/json/struct/shutil 這些內建模組）。
+
+安裝步驟（跟上面「畫愛心」幾乎一樣，只是換一支腳本）：
+
+  1) 取得擴充功能 ID（同上面步驟 1，跟畫愛心那個共用同一個 ID）。
+
+  2) 在 native_host 資料夾開 cmd，貼上：
+
+         powershell -ExecutionPolicy Bypass -File install_file_manager.ps1 -ExtensionId 你的ID
+
+  3) 看到類似下面的輸出代表安裝成功：
+
+         Installed native messaging host: com.pubmed_downloader.file_manager
+           manifest:  ...\com.pubmed_downloader.file_manager.json
+           bat:       ...\python_file_manager.bat
+           extension: chrome-extension://你的ID/
+
+  4) 回 chrome://extensions 把擴充功能重新整理一次，打開 popup，勾選
+     「本地資料夾模式」→ 點「📂 選擇專案資料夾...」，能跳出 Windows 資料夾
+     選擇視窗就代表裝好了。
+
+解除安裝：
+      reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.file_manager" /f
+
+疑難排解：
+  - 點「選擇專案資料夾」完全沒反應：native host 還沒裝好，回到上面
+    1)～3) 重跑一次；勾選「本地資料夾模式」但沒裝這個 host 的話，擴充
+    功能會自動退回原本的 chrome.downloads 下載方式，不影響既有功能。
+  - 想看詳細錯誤：native_host\file_manager_debug\ 資料夾（第一次出錯時
+    才會自動建立）裡的 ERROR_*.txt。

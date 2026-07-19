@@ -3,6 +3,7 @@
   "name": "PubMed PDF 批次下載器 v6",
   "version": "6.0.1",
   "description": "批次下載 PubMed 論文 PDF，支援 CMU EZproxy 授權、並行下載、暫停/繼續",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoZRhlL8WhmBF7gfJRHgBtjBNtek3cxwVAbxTEWXEwqHTK4tR3w5N01aVcuZpJ9vWUyGAwnWjG+iGJVxNjaKdcMsWdYuIJF7ZpjeQv/ImFbJRZgJdRXNE8I22IDuDL1oqQmvkw1I7dWJUlyDgNuBLeqyJSmHIZ8B6OWVyX/XljvXoILDIMn156c0Qny80OFRx8eFuOdgq0/z879DYeMWzl8rSDhe+A+vA/+JwIzrnjGCLdQdMPZ79jKE5NC2TVB+pTCbfUSCkEiOsxWb1jjdA/GpOen68Oen4TQHmp7GDHtokEWdJZt8Enay41oYaDl7fSV81TckgSs26IRFCivFQ9wIDAQAB",
   "permissions": [
     "downloads",
     "tabs",
@@ -12,7 +13,8 @@
     "cookies",
     "notifications",
     "windows",
-    "debugger"
+    "debugger",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -24,7 +26,8 @@
     "https://*.elsevier.com/*",
     "https://*.sciencedirect.com/*",
     "https://*.wiley.com/*",
-    "https://*.springer.com/*"
+    "https://*.springer.com/*",
+    "chrome-extension://ngkjkkofhbbemmjobfifbifigkijbpbo/*"
   ],
   "action": {
     "default_icon": {
