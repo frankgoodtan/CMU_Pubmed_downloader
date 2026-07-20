@@ -29,6 +29,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEBUG_DIR = BASE_DIR / "file_manager_debug"
+DEBUG_LOG_DIR = BASE_DIR / "debug_log"
 
 SUBFOLDERS = ["下載成功", "下載失敗", "下次重試", "進度管理"]
 STATUS_FOLDERS = ["下載成功", "下載失敗", "下次重試"]
@@ -182,6 +183,33 @@ def cmd_move_file(msg):
     return {"ok": True}
 
 
+def cmd_write_debug_log(msg):
+    # 整批下載的留痕紀錄，跟「本地資料夾模式」的專案 root 無關——固定寫在 host
+    # 腳本自己旁邊的 debug_log/，不管使用者這次跑的是哪個專案資料夾都收在同一處，
+    # 所以檔名要自己帶專案/Excel 名稱才分得出這篇是哪次跑的（background.js 那邊
+    # 組好檔名再傳過來，這裡只再用 Path(...).name 防呆一次，不信任呼叫端）。
+    DEBUG_LOG_DIR.mkdir(exist_ok=True)
+    filename = Path(msg["filename"]).name
+    target = DEBUG_LOG_DIR / filename
+    target.write_text(msg.get("content", ""), encoding="utf-8")
+
+    max_files = int(msg.get("maxFiles", 20))
+    files = sorted(
+        (p for p in DEBUG_LOG_DIR.iterdir() if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    deleted = []
+    while len(files) > max_files:
+        oldest = files.pop(0)
+        try:
+            oldest.unlink()
+            deleted.append(oldest.name)
+        except Exception:
+            pass  # 刪不掉（例如被其他程式開著）就留著，下次再試，不算整個指令失敗
+
+    return {"ok": True, "path": str(target), "deleted": deleted}
+
+
 def cmd_list_status_folders(msg):
     root = Path(msg["root"])
     result = {}
@@ -206,6 +234,7 @@ COMMANDS = {
     "delete_paths": cmd_delete_paths,
     "move_file": cmd_move_file,
     "list_status_folders": cmd_list_status_folders,
+    "write_debug_log": cmd_write_debug_log,
 }
 SELF_RESPONDING = {"find_progress_excel"}
 

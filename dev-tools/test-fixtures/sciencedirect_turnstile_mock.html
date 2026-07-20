@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en-us">
+<head>
+  <meta charset="UTF-8">
+  <title>Security verification</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <!--
+    人機驗證偵測/提醒流程的測試靶場頁（Debug 用）。
+    不是要重現 Elsevier/ScienceDirect 那個真正的驗證頁——那個頁面本身、它的品牌
+    素材、還有它綁定 Elsevier 網域的 Cloudflare sitekey 都不屬於這個專案，照抄
+    過來部署在別的網域上不合適。
+
+    這裡只保留 background.js / verify_test.js 偵測邏輯實際依賴的東西：
+      1. <title>「Security verification」跟 body 文字「Request Verification:
+         In Progress」——isManualVerificationText() 靠這些字串判斷是不是驗證頁
+         （見 background.js 的 isManualVerificationText()）。
+      2. .cf-turnstile 這個 class——tabShowsManualVerification() 認得的挑戰
+         元件選擇器之一。
+      3. Cloudflare Turnstile 官方公開的「一律顯示互動式挑戰」測試 sitekey
+         3x00000000000000000000FF（見 https://developers.cloudflare.com/turnstile/troubleshooting/testing/）。
+         這是 Cloudflare 自己發布、任何網域都能合法嵌入測試用的假 sitekey，
+         不需要、也不會冒用任何人的真實網站驗證設定，渲染出來的 checkbox 元件
+         跟正式環境視覺上一致，native_host 的樣板比對可以照常測試。
+
+    用法：把這個檔案內容貼到 https://frankgoodtan.github.io/verift_element_test/
+    對應的 repo 裡（取代/更新原本的 element_test.html），或直接用這個檔名部署。
+    verify_test.js 的 ELEMENT_TEST_PAGE_URL 常數要跟實際部署網址一致。
+  -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+  <style>
+    html, body {
+      background: #fff;
+      font-family: Arial, Helvetica, sans-serif;
+      margin: 0;
+      padding: 0;
+    }
+    .challenge {
+      max-width: 480px;
+      margin: 80px auto;
+      padding: 32px;
+      text-align: center;
+      background: #ebf1f9;
+    }
+    .challenge h1.title {
+      font-size: 24px;
+      margin-bottom: 16px;
+    }
+    .cf-turnstile {
+      display: inline-block;
+      margin: 24px auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="challenge" style="display:block;">
+    <h1 class="title">Request Verification: In Progress</h1>
+    <p>This is a local test fixture, not a real publisher verification page.</p>
+    <form id="form1" class="captcha-form" action="#" method="POST">
+      <div class="cf-turnstile"
+           data-sitekey="3x00000000000000000000FF"
+           data-theme="light"
+           data-appearance="always"></div>
+    </form>
+  </div>
+</body>
+</html>

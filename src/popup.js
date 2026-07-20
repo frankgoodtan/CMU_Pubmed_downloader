@@ -30,8 +30,18 @@ const batchSizeInput   = document.getElementById("batchSizeInput");
 const politeModeRow    = document.getElementById("politeModeRow");
 const politeModeInput  = document.getElementById("politeModeInput");
 const startFromInput   = document.getElementById("startFromInput");
+const startFromBrowseBtn = document.getElementById("startFromBrowseBtn");
+const endAtRow         = document.getElementById("endAtRow");
+const endAtInput       = document.getElementById("endAtInput");
+const endAtBrowseBtn   = document.getElementById("endAtBrowseBtn");
 const stopAfterInput   = document.getElementById("stopAfterInput");
 const stopAfterRow     = document.getElementById("stopAfterRow");
+// 起始/結束論文選擇器（可搜尋的彈出視窗，見 openPaperPicker()）
+const paperPickerOverlay    = document.getElementById("paperPickerOverlay");
+const paperPickerTitle      = document.getElementById("paperPickerTitle");
+const paperPickerSearch     = document.getElementById("paperPickerSearch");
+const paperPickerList       = document.getElementById("paperPickerList");
+const paperPickerCancelBtn  = document.getElementById("paperPickerCancelBtn");
 // 測試工具（Debug 用，統一收合成一顆小按鈕；點了才會展開，不會自動觸發任何動作）
 const testToolsRow        = document.getElementById("testToolsRow");
 const testToolsPanel      = document.getElementById("testToolsPanel");
@@ -42,7 +52,6 @@ const testDownloadBtn      = document.getElementById("testDownloadBtn");
 const testDownloadMatchInfo = document.getElementById("testDownloadMatchInfo");
 // 進階設定面板（人機驗證選項＋出版商 API 憑證）的 UI 邏輯在 api_settings.js（AdvancedSettings）
 const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
-const preVerifyInput   = document.getElementById("preVerifyInput");
 const verifySection    = document.getElementById("verifySection");
 const verifyUrlNote    = document.getElementById("verifyUrlNote");
 const verifyQueueNote  = document.getElementById("verifyQueueNote");
@@ -306,7 +315,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === "SHOW_CAPTCHA") showCaptchaSection(msg.imgBase64);
   // 整批下載跑完後 background 主動核對本地資料夾，發現有差異時推這個訊息過來
   // （不是回應某個 popup 請求，見 background.js finishAll()）。
-  if (msg.action === "SHOW_LOCAL_FOLDER_DIFF") renderLocalFolderDiff(msg.diff, null);
+  if (msg.action === "SHOW_LOCAL_FOLDER_DIFF") renderLocalFolderDiff(msg.diff);
   if (msg.action === "LOGIN_OK") {
     hideLoginSection();
     hideManualLoginWait();
@@ -730,19 +739,128 @@ function sanitizeDownloadFolder(folder) {
   return cleaned || getDefaultDownloadFolder();
 }
 
-function applyStartFrom(list, query) {
+function findTargetIndex(list, query) {
   const q = String(query || "").trim().toLowerCase();
-  if (!q) return { list, index: 0, matched: null };
-
+  if (!q) return { index: -1, matched: null, empty: true };
   const index = list.findIndex(item => {
     const pmid = String(item.pmid || "").toLowerCase();
     const title = String(item.title || "").toLowerCase();
     return pmid === q || pmid.includes(q) || title.includes(q);
   });
-
-  if (index < 0) return { list, index: 0, matched: null, notFound: true };
-  return { list: list.slice(index), index, matched: list[index] };
+  return { index, matched: index >= 0 ? list[index] : null, empty: false };
 }
+
+// 「起始 PMID/title」～「結束 PMID/title」範圍下載：兩邊都用 PMID 或標題關鍵字在
+// 目前這個篩選模式（Y/all/retry）的清單裡各自找一次位置，回傳只包含 [起點,終點]
+// （含頭尾）的子清單。任一邊留空 = 那一邊不設限（起點留空從頭開始、終點留空到底
+// 為止）；找不到指定的起點/終點時整個範圍視為無效，回傳原始清單並標記錯誤，交由
+// 呼叫端決定要不要擋下開始下載。
+function applyRange(list, startQuery, endQuery) {
+  const startInfo = findTargetIndex(list, startQuery);
+  const endInfo   = findTargetIndex(list, endQuery);
+
+  if (!startInfo.empty && startInfo.index < 0) {
+    return { list, startInfo, endInfo, startNotFound: true };
+  }
+  if (!endInfo.empty && endInfo.index < 0) {
+    return { list, startInfo, endInfo, endNotFound: true };
+  }
+
+  const startIndex = startInfo.empty ? 0 : startInfo.index;
+  const endIndex   = endInfo.empty ? list.length - 1 : endInfo.index;
+
+  if (endIndex < startIndex) {
+    return { list, startInfo, endInfo, rangeInvalid: true };
+  }
+
+  return { list: list.slice(startIndex, endIndex + 1), startInfo, endInfo, startIndex, endIndex };
+}
+
+function logRangeApplied(rangeInfo) {
+  if (rangeInfo.startNotFound) {
+    appendLog("⚠ 找不到指定的起始 PMID/title，已忽略範圍設定，改用全部清單。", "warn");
+  } else if (rangeInfo.endNotFound) {
+    appendLog("⚠ 找不到指定的結束 PMID/title，已忽略範圍設定，改用全部清單。", "warn");
+  } else if (rangeInfo.rangeInvalid) {
+    appendLog("⚠ 結束論文出現在起始論文之前，範圍設定無效，已改用全部清單。", "warn");
+  } else if (rangeInfo.startInfo?.matched || rangeInfo.endInfo?.matched) {
+    const startLabel = rangeInfo.startInfo?.matched ? `第 ${rangeInfo.startIndex + 1} 篇` : "第 1 篇";
+    const endLabel   = rangeInfo.endInfo?.matched   ? `第 ${rangeInfo.endIndex + 1} 篇`   : "最後一篇";
+    appendLog(`↪ 下載範圍：${startLabel}～${endLabel}（共 ${rangeInfo.list.length} 篇）`, "info");
+  }
+}
+
+// ══════════════════════════════════
+// 起始/結束論文選擇器：可搜尋的彈出視窗，列出目前篩選模式（Y/all/retry）下的
+// 清單（跟 applyRange() 切範圍用的是同一份 allParsedTargets，序號才會一致），
+// 點一筆就把 PMID（沒有 PMID 才用標題）填進對應輸入框，觸發 change 讓範圍即時重算。
+// ══════════════════════════════════
+let paperPickerTargetInput = null;
+
+function renderPaperPickerList(filterText) {
+  if (!paperPickerList) return;
+  const q = String(filterText || "").trim().toLowerCase();
+  const source = (allParsedTargets || []).map((item, idx) => ({ item, idx }));
+  const matched = q
+    ? source.filter(({ item }) => {
+        const pmid = String(item.pmid || "").toLowerCase();
+        const title = String(item.title || "").toLowerCase();
+        return pmid.includes(q) || title.includes(q);
+      })
+    : source;
+
+  paperPickerList.innerHTML = "";
+  if (!matched.length) {
+    paperPickerList.innerHTML = '<div class="picker-empty">沒有符合的論文</div>';
+    return;
+  }
+  const LIMIT = 200;
+  matched.slice(0, LIMIT).forEach(({ item, idx }) => {
+    const row = document.createElement("div");
+    row.className = "picker-item";
+    row.innerHTML = `<span class="picker-item-seq">#${idx + 1}</span>` +
+      (item.pmid ? `<span class="picker-item-pmid">PMID:${item.pmid}</span>` : "") +
+      `<span>${diffTruncate(item.title || "(無標題)", 60)}</span>`;
+    row.addEventListener("click", () => {
+      if (paperPickerTargetInput) {
+        paperPickerTargetInput.value = item.pmid || item.title || "";
+        paperPickerTargetInput.dispatchEvent(new Event("change"));
+      }
+      closePaperPicker();
+    });
+    paperPickerList.appendChild(row);
+  });
+  if (matched.length > LIMIT) {
+    const more = document.createElement("div");
+    more.className = "picker-empty";
+    more.textContent = `還有 ${matched.length - LIMIT} 筆，請輸入關鍵字縮小範圍`;
+    paperPickerList.appendChild(more);
+  }
+}
+
+function openPaperPicker(targetInput, titleText) {
+  if (!allParsedTargets || !allParsedTargets.length) {
+    appendLog("⚠ 請先上傳/載入 Excel 後再瀏覽論文清單。", "warn");
+    return;
+  }
+  paperPickerTargetInput = targetInput;
+  if (paperPickerTitle) paperPickerTitle.textContent = titleText;
+  if (paperPickerSearch) paperPickerSearch.value = "";
+  renderPaperPickerList("");
+  paperPickerOverlay?.classList.add("show");
+  paperPickerSearch?.focus();
+}
+
+function closePaperPicker() {
+  paperPickerOverlay?.classList.remove("show");
+  paperPickerTargetInput = null;
+}
+
+startFromBrowseBtn?.addEventListener("click", () => openPaperPicker(startFromInput, "選擇起始論文"));
+endAtBrowseBtn?.addEventListener("click", () => openPaperPicker(endAtInput, "選擇結束論文"));
+paperPickerCancelBtn?.addEventListener("click", closePaperPicker);
+paperPickerSearch?.addEventListener("input", () => renderPaperPickerList(paperPickerSearch.value));
+paperPickerOverlay?.addEventListener("click", e => { if (e.target === paperPickerOverlay) closePaperPicker(); });
 
 // 讀取目前選取的下載範圍："Y"（Column M = Y）| "all"（全部）| "retry"（僅「下次重試」）
 function getFilterMode() {
@@ -768,12 +886,17 @@ function parseExcel(arrayBuffer, mode, options = {}) {
   workbookData = wb;
 
   // 序號前綴跟 buildAllRowsFromWorkbook() 共用同一套「略過空列」規則走出來的順位，
-  // 這裡直接借用它算好的 seqLabel，確保兩邊對同一列算出來的序號永遠一致（就算這裡
-  // 因為斷點續傳/Column M 篩選而跳過某些列，序號本身不受影響）。多解析一次工作表
+  // 這裡直接借用它算好的 seqLabel/seq，確保兩邊對同一列算出來的序號永遠一致（就算
+  // 這裡因為斷點續傳/Column M 篩選而跳過某些列，序號本身不受影響）。多解析一次工作表
   // 不是熱路徑，用簡單換一致性是合理取捨。
-  const seqLabelByRowIndex = new Map(
-    buildAllRowsFromWorkbook(arrayBuffer).map(r => [r.rowIndex, r.seqLabel])
-  );
+  //
+  // 這個順位＝整份 Excel 裡「有資料的列」（跳過空列/標題列）由上往下數的第幾篇，
+  // 不管 Column M 是 Y 或 N 都算進去——跟檔案命名/核對用的序號是同一套，這樣「第
+  // 幾篇」在檔名、log、核對報告裡才會永遠對得起來，也不會因為之後改動 Y/N 篩選
+  // 判斷而跟著跳號。
+  const allWorkbookRows = buildAllRowsFromWorkbook(arrayBuffer);
+  const seqLabelByRowIndex = new Map(allWorkbookRows.map(r => [r.rowIndex, r.seqLabel]));
+  const paperNoByRowIndex  = new Map(allWorkbookRows.map(r => [r.rowIndex, r.seq]));
 
   // 找目標工作表
   let ws = wb.Sheets[SHEET_NAME];
@@ -834,6 +957,7 @@ function parseExcel(arrayBuffer, mode, options = {}) {
 
     found.push({
       rowIndex:  i + 1,
+      paperNo:   paperNoByRowIndex.get(i + 1) ?? null,
       pmid,
       title:     titleStr,
       safeTitle,
@@ -984,13 +1108,9 @@ function ingestExcelArrayBuffer(arrayBuffer, displayName) {
   const filterMode = getFilterMode();
   document.getElementById("downloadAllCheck").value = filterMode === "all" ? "1" : "0";
   allParsedTargets = parseExcel(arrayBuffer, filterMode);
-  const startInfo = applyStartFrom(allParsedTargets, startFromInput?.value || "");
-  targets = startInfo.list;
-  if (startInfo.notFound) {
-    appendLog("⚠ 找不到指定的起始 PMID/title，已改為從頭開始。", "warn");
-  } else if (startInfo.matched) {
-    appendLog(`↪ 從第 ${startInfo.index + 1} 筆目標開始: ${startInfo.matched.pmid || ""} ${startInfo.matched.title || ""}`, "info");
-  }
+  const rangeInfo = applyRange(allParsedTargets, startFromInput?.value || "", endAtInput?.value || "");
+  targets = rangeInfo.list;
+  logRangeApplied(rangeInfo);
 
   // 計算各模式篇數供顯示
   try {
@@ -1018,6 +1138,7 @@ function ingestExcelArrayBuffer(arrayBuffer, displayName) {
   if (politeModeRow) politeModeRow.style.display = "flex";
   AdvancedSettings.show();
   if (startFromRow) startFromRow.style.display = "flex";
+  if (endAtRow) endAtRow.style.display = "flex";
   if (stopAfterRow) stopAfterRow.style.display = "flex";
   if (testToolsRow) testToolsRow.style.display = "flex";
   startBtn.disabled = targets.length === 0;
@@ -1184,8 +1305,8 @@ function rebuildTargetsFromCache() {
   const filterMode = getFilterMode();
   document.getElementById("downloadAllCheck").value = filterMode === "all" ? "1" : "0";
   allParsedTargets = parseExcel(cachedArrayBuffer, filterMode);
-  const startInfo = applyStartFrom(allParsedTargets, startFromInput?.value || "");
-  targets = startInfo.list;
+  const rangeInfo = applyRange(allParsedTargets, startFromInput?.value || "", endAtInput?.value || "");
+  targets = rangeInfo.list;
   const modeText = filterModeText(filterMode);
   renderFileInfoLine(originalFilename, targets.length, modeText);
   startBtn.disabled = targets.length === 0;
@@ -1196,6 +1317,9 @@ function rebuildTargetsFromCache() {
 document.querySelectorAll("input[name='filterMode']").forEach(input => {
   input.addEventListener("change", rebuildTargetsFromCache);
 });
+// 起始/結束範圍改變時即時重算篇數顯示，不用等到按下「開始」才知道範圍對不對
+startFromInput?.addEventListener("change", rebuildTargetsFromCache);
+endAtInput?.addEventListener("change", rebuildTargetsFromCache);
 
 // ══════════════════════════════════
 // 本地資料夾模式：一份 Excel 對應一個專屬資料夾（下載成功/下載失敗/下次重試/
@@ -1237,6 +1361,7 @@ function resetLoadedExcelState(showUpload = true) {
   if (batchRow) batchRow.style.display = "none";
   if (politeModeRow) politeModeRow.style.display = "none";
   if (startFromRow) startFromRow.style.display = "none";
+  if (endAtRow) endAtRow.style.display = "none";
   if (stopAfterRow) stopAfterRow.style.display = "none";
   if (testToolsRow) testToolsRow.style.display = "none";
   AdvancedSettings.hide();
@@ -1244,16 +1369,15 @@ function resetLoadedExcelState(showUpload = true) {
 }
 
 // 本地資料夾模式核對報告：完全一致就只記一筆 log；有差異就跳出 modal 讓使用者決定
-// 要不要同步（見 background.js 的 computeLocalFolderDiff/applyLocalFolderDiff）。
-// rows 是這次核對送出去的同一份列清單，「同步更新」時要原封不動再送一次給
-// APPLY_LOCAL_FOLDER_SYNC（background 會重新算一次最新差異，不信任這裡的舊結果）。
-function renderLocalFolderDiff(diff, rows) {
+// 要不要同步（見 background.js 的 computeLocalFolderDiff/applyLocalFolderDiff——
+// 兩者都直接讀 storage 裡最新的 Excel 本身，這裡不需要也不會傳遞任何列清單）。
+function renderLocalFolderDiff(diff) {
   if (!diff || diff.skipped) return;
   if (diff.clean) {
     appendLog("✅ 核對完成：Excel 與資料夾狀態完全一致，沒有需要同步的差異。", "ok");
     return;
   }
-  showLocalFolderDiffModal(diff, rows);
+  showLocalFolderDiffModal(diff);
 }
 
 function diffTruncate(text, max) {
@@ -1281,7 +1405,7 @@ const DIFF_CONFLICT_LABEL = {
   fail_vs_retry:"以較新時間的紀錄為準",
 };
 
-function showLocalFolderDiffModal(diff, rows) {
+function showLocalFolderDiffModal(diff) {
   diffSummaryLine.textContent =
     `共 ${diff.summary.total} 篇：不一致 ${diff.summary.mismatchCount}、衝突 ${diff.summary.conflictCount}、異常檔案 ${diff.summary.anomalyCount}`;
 
@@ -1302,7 +1426,7 @@ function showLocalFolderDiffModal(diff, rows) {
   diffApplyBtn.onclick = () => {
     localDiffOverlay.classList.remove("show");
     appendLog("🔄 正在同步本地資料夾狀態回 Excel…", "info");
-    chrome.runtime.sendMessage({ action: "APPLY_LOCAL_FOLDER_SYNC", rows }, res => {
+    chrome.runtime.sendMessage({ action: "APPLY_LOCAL_FOLDER_SYNC" }, res => {
       if (res?.ok) {
         appendLog(`🔄 已同步：修正 ${res.changed || 0} 列、清掉 ${res.deletedStaleFiles || 0} 個殘留檔案${res.anomalyCount ? `，另有 ${res.anomalyCount} 個異常檔案僅供你自行確認` : ""}。`, "ok");
         // background 已經把最新狀態寫進磁碟上的進度管理 Excel，但 popup 手上的
@@ -1359,20 +1483,15 @@ function openLocalProject(root, expectedMode = null) {
       // 的核對結果覆蓋掉的過渡訊息，核對完就清空，不重複講一次資料夾名稱跟篇數。
       if (localFolderSummary) localFolderSummary.textContent = "🔎 核對進度中…";
       appendLog(`📂 已接續本地專案「${res.base}」，開始核對資料夾與進度是否一致…`, "info");
-      // 核對要看到「全部列」（含已標記成功/失敗的），不能只用 parseExcel() 過濾後的
-      // 待處理清單，不然發現不了「Excel 說成功、但資料夾裡其實沒有那個檔案」這種飄移
-      let allRows = [];
-      try { allRows = buildAllRowsFromWorkbook(cachedArrayBuffer); } catch (e) {}
-      const diffRows = allRows.map(r => ({
-        rowIndex: r.rowIndex, title: r.title, safeTitle: r.safeTitle, seqLabel: r.seqLabel, status: r.status,
-      }));
-      chrome.runtime.sendMessage({ action: "RECONCILE_LOCAL_FOLDER", rows: diffRows }, rres => {
+      // 核對比對的是 background 那邊 storage 裡現存最新的 Excel 本身（見
+      // background.js buildAllRowsFromStorage()），不需要這裡先算好列清單再送過去。
+      chrome.runtime.sendMessage({ action: "RECONCILE_LOCAL_FOLDER" }, rres => {
         if (rres?.ok) {
           // 核對完成：清掉過渡訊息，不然「✅ 目前專案：X（已核對）」會跟下面
           // fileInfo 那行的資料夾/檔名/篇數重複，看起來像兩件不同的事。乾不乾淨的
           // 結果本身已經由 renderLocalFolderDiff()（log 或跳出的核對報告）交代過了。
           if (localFolderSummary) localFolderSummary.textContent = "";
-          renderLocalFolderDiff(rres.diff, diffRows);
+          renderLocalFolderDiff(rres.diff);
         } else {
           appendLog(`⚠ 核對進度失敗：${rres?.error || "未知錯誤"}`, "warn");
         }
@@ -1512,17 +1631,14 @@ function runLocalFolderReconcile() {
     appendLog("⚠ 請先選擇專案資料夾並載入 Excel 後再核對。", "warn");
     return;
   }
-  let allRows = [];
-  try { allRows = buildAllRowsFromWorkbook(cachedArrayBuffer); } catch (e) {}
-  const diffRows = allRows.map(r => ({
-    rowIndex: r.rowIndex, title: r.title, safeTitle: r.safeTitle, seqLabel: r.seqLabel, status: r.status,
-  }));
   localFolderReconcileBtn.disabled = true;
   appendLog("🔄 開始核對進度…", "info");
-  chrome.runtime.sendMessage({ action: "RECONCILE_LOCAL_FOLDER", rows: diffRows }, res => {
+  // 核對比對的是 background 那邊 storage 裡現存最新的 Excel 本身（見
+  // background.js buildAllRowsFromStorage()），不是這裡送過去的任何快照。
+  chrome.runtime.sendMessage({ action: "RECONCILE_LOCAL_FOLDER" }, res => {
     localFolderReconcileBtn.disabled = false;
     if (res?.ok) {
-      renderLocalFolderDiff(res.diff, diffRows);
+      renderLocalFolderDiff(res.diff);
     } else {
       appendLog(`❌ 核對進度失敗：${res?.error || "未知錯誤"}`, "fail");
     }
@@ -1575,7 +1691,6 @@ function launchDownload(targetsList, { testMode = false } = {}) {
     politeMode,
     stopAfter,
     manualVerifyPause: manualVerifyPauseInput?.checked !== false,
-    preVerifyElsevier: preVerifyInput?.checked === true,
     publisherApiCreds: AdvancedSettings.getCreds(),
     testMode,
   }, res => {
@@ -1596,12 +1711,20 @@ startBtn.addEventListener("click", () => {
     const filterMode = getFilterMode();
     document.getElementById("downloadAllCheck").value = filterMode === "all" ? "1" : "0";
     allParsedTargets = parseExcel(cachedArrayBuffer, filterMode);
-    const startInfo = applyStartFrom(allParsedTargets, startFromInput?.value || "");
-    targets = startInfo.list;
-    if (startInfo.notFound) {
+    const rangeInfo = applyRange(allParsedTargets, startFromInput?.value || "", endAtInput?.value || "");
+    if (rangeInfo.startNotFound) {
       alert("找不到指定的起始 PMID/title，請修正或留空。");
       return;
     }
+    if (rangeInfo.endNotFound) {
+      alert("找不到指定的結束 PMID/title，請修正或留空。");
+      return;
+    }
+    if (rangeInfo.rangeInvalid) {
+      alert("結束論文出現在起始論文之前，請修正起始/結束範圍。");
+      return;
+    }
+    targets = rangeInfo.list;
     const modeText = filterModeText(filterMode);
     renderFileInfoLine(originalFilename, targets.length, modeText);
   }
@@ -1741,6 +1864,7 @@ clearBtn.addEventListener("click", () => {
   AdvancedSettings.hide();
   if (verifySection)    verifySection.style.display    = "none";
   if (startFromRow)     startFromRow.style.display     = "none";
+  if (endAtRow)         endAtRow.style.display         = "none";
   if (stopAfterRow)     stopAfterRow.style.display     = "none";
   if (testToolsRow) testToolsRow.style.display = "none";
   if (testToolsPanel) testToolsPanel.style.display = "none";
@@ -1767,10 +1891,10 @@ clearBtn.addEventListener("click", () => {
   if (downloadFolderInput) downloadFolderInput.value = getDefaultDownloadFolder();
   if (batchSizeInput) batchSizeInput.value = "0";
   if (startFromInput) startFromInput.value = "";
+  if (endAtInput) endAtInput.value = "";
   if (stopAfterInput) stopAfterInput.value = "200";
   if (politeModeInput) politeModeInput.checked = true;
   if (manualVerifyPauseInput) manualVerifyPauseInput.checked = true;
-  if (preVerifyInput) preVerifyInput.checked = true;
   const filterY = document.getElementById("filterY");
   const filterAll = document.getElementById("filterAll");
   const filterRetry = document.getElementById("filterRetry");

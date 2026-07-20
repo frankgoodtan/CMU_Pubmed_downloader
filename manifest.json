@@ -37,11 +37,11 @@
     }
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "src/background.js"
   },
   "web_accessible_resources": [
     {
-      "resources": ["xlsx.full.min.js", "exceljs.bare.min.js", "popup.html", "popup.js"],
+      "resources": ["src/xlsx.full.min.js", "src/exceljs.bare.min.js", "src/popup.html", "src/popup.js"],
       "matches": ["<all_urls>"]
     }
   ]

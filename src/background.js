@@ -53,7 +53,7 @@ chrome.action.onClicked.addListener(async () => {
   }
 
   const win = await chrome.windows.create({
-    url: chrome.runtime.getURL("popup.html"),
+    url: chrome.runtime.getURL("src/popup.html"),
     type: "popup",
     width: 540,
     height: 680,
@@ -85,12 +85,18 @@ const PUBMED_DIRECT = "https://pubmed.ncbi.nlm.nih.gov";
 const STATUS_SUCCESS = "下載成功";
 const STATUS_FAIL    = "下載失敗";
 const STATUS_RETRY   = "下次重試";
+// 「🧪 測試下載指定文獻」專用的資料夾（一般 Chrome 下載模式下是 downloadFolder
+// 底下的子資料夾；本地資料夾模式下是專案根目錄底下的子資料夾，沒有就用 write_bytes
+// 寫檔時自動建立，不需要跟其他保留子資料夾一樣在 init_root 時就先建好）。測試下載
+// 全程都用這個資料夾，不進 下載成功/下載失敗/下次重試，也不寫入 G.resultsMap／
+// 進度 Excel／Storage 完成紀錄，確保跟正式下載的檔案與進度統計完全分開。
+const TEST_FOLDER_NAME = "測試資料夾";
 // 本地資料夾模式專案根目錄底下固定會有的四個保留子資料夾名稱（見
 // native_host/python_file_manager.py 的 SUBFOLDERS）。OPEN_LOCAL_PROJECT 用這份
 // 名單擋下「選到了專案內部的子資料夾，而不是專案本身」的選擇錯誤——不擋的話
 // init_root 會在裡面又建一次同樣四個子資料夾，越選越深，見 PROJECT_ROOT_RESERVED_NAMES
 // 的呼叫點。
-const PROJECT_ROOT_RESERVED_NAMES = [STATUS_SUCCESS, STATUS_FAIL, STATUS_RETRY, "進度管理"];
+const PROJECT_ROOT_RESERVED_NAMES = [STATUS_SUCCESS, STATUS_FAIL, STATUS_RETRY, "進度管理", TEST_FOLDER_NAME];
 const PUBMED_FULL_TEXT_WAIT_MS = 60000;
 const WORKER_TAB_RECYCLE_EVERY = 15;
 
@@ -163,6 +169,11 @@ function resetState() {
     statsProjectBase: "",
     logs:          [],
     threadLogs:    [],
+    // 本次執行的完整留痕紀錄（debug log 檔案用）：跟 logs/threadLogs 不同，這裡
+    // 不設上限、不會被 shift 掉舊資料——logs/threadLogs 是給即時 UI 顯示用，太長
+    // 會拖垮畫面所以有 cap；debug log 要的是「這一整批跑下來全部發生過的事」，
+    // 只在 finishAll() 寫成檔案那一刻才用完即棄，所以沒有保留上限的理由。
+    debugRun: { logs: [], threadLogs: [], failureNotes: [], startedAt: Date.now() },
     resultsMap:    {},
     downloadFolder:"PubMed_PDFs",
     batchSize:     0,
@@ -199,7 +210,6 @@ function resetState() {
     cookieCleanupRestartEpoch: 0,
     // 人機驗證暫停機制：偵測到出版社驗證頁時暫停派發，開分頁讓使用者手動通過
     manualVerifyPause: true,
-    preVerifyElsevier: false,
     // 出版商官方 API 憑證（publisher_apis.js 的註冊表；例：{ elsevier: { apiKey, insttoken } }）
     // 有設定的出版商，其論文優先走 API 下載
     publisherApiCreds: {},
@@ -299,9 +309,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           await fmRequest("init_root", { root });
           const found = await fmRequest("find_progress_excel", { root });
           if (found.found) {
+            const cleanedB64 = await stripStatusHighlightB64(found.dataB64, { baseName: found.base });
+            if (cleanedB64 !== found.dataB64) {
+              // 清掉的黃色高亮也要落地回磁碟上的進度檔，不然只清記憶體/畫面，
+              // 使用者直接用 Excel 開那個檔案還是會看到上一輪的舊黃色。
+              await fmRequest("write_bytes", {
+                root, relPath: `進度管理/${found.base}_進度管理.xlsx`, dataB64: cleanedB64,
+              }).catch(e => addThreadLog("Rewrite cleaned progress excel failed", { error: e?.message || String(e) }));
+            }
             await chrome.storage.local.set({
-              sourceExcelB64: found.dataB64,
-              latestExcelB64: found.dataB64,
+              sourceExcelB64: cleanedB64,
+              latestExcelB64: cleanedB64,
               excelMeta: { baseName: found.base, folder: "PubMed_PDFs" },
               localFolderRootPath: root,
               localFolderModeEnabled: true,
@@ -309,7 +327,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             });
             resetRunStatsForProject(found.base);
             addThreadLog("OPEN_LOCAL_PROJECT resumed", { root, base: found.base });
-            sendResponse({ ok: true, resumed: true, base: found.base, dataB64: found.dataB64 });
+            sendResponse({ ok: true, resumed: true, base: found.base, dataB64: cleanedB64 });
           } else {
             await chrome.storage.local.set({
               localFolderRootPath: root,
@@ -402,7 +420,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // 只計算差異、不寫入任何東西——回傳的 diff 交給 popup 呈現報告，使用者確認
     // 「同步更新」後才會另外送 APPLY_LOCAL_FOLDER_SYNC 真正套用。
     case "RECONCILE_LOCAL_FOLDER":
-      computeLocalFolderDiff(msg.rows || null)
+      computeLocalFolderDiff()
         .then(diff => sendResponse({ ok: true, diff }))
         .catch(e => {
           addThreadLog("RECONCILE_LOCAL_FOLDER failed", { error: e.message });
@@ -413,7 +431,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // 使用者在核對報告上按下「同步更新」才會送這個，真正把差異寫回 resultsMap/Excel、
     // 刪掉衝突標記要清的殘留檔。
     case "APPLY_LOCAL_FOLDER_SYNC":
-      applyLocalFolderDiff(msg.rows || null)
+      applyLocalFolderDiff()
         .then(result => sendResponse({ ok: true, ...result }))
         .catch(e => {
           addThreadLog("APPLY_LOCAL_FOLDER_SYNC failed", { error: e.message });
@@ -448,7 +466,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         G.stopAfter  = Math.max(0, parseInt(msg.stopAfter  || 0, 10) || 0);
         G.politeMode = msg.politeMode !== false;
         G.manualVerifyPause = msg.manualVerifyPause !== false;
-        G.preVerifyElsevier = !!msg.preVerifyElsevier;
         G.publisherApiCreds = msg.publisherApiCreds || {};
         G.total      = targets.length;
         G.queue      = targets.map((_, i) => i);
@@ -614,8 +631,10 @@ function getPublicState() {
 
 // ── 日誌 & 通知 ──
 function addLog(msg, type = "info", workerIdx = -1) {
-  G.logs.push({ msg, type, workerIdx, time: Date.now() });
+  const entry = { msg, type, workerIdx, time: Date.now() };
+  G.logs.push(entry);
   if (G.logs.length > 1000) G.logs.shift();
+  if (G.debugRun) G.debugRun.logs.push(entry);
   chrome.runtime.sendMessage({ action: "LOG", msg, type, workerIdx }).catch(() => {});
 }
 
@@ -624,6 +643,7 @@ function addThreadLog(msg, data = null) {
   const entry = { msg, data, time: Date.now() };
   G.threadLogs.push(entry);
   if (G.threadLogs.length > 2000) G.threadLogs.shift();
+  if (G.debugRun) G.debugRun.threadLogs.push(entry);
   chrome.runtime.sendMessage({ action: "THREAD_LOG", entry }).catch(() => {});
 }
 
@@ -707,13 +727,6 @@ async function startDownloadEngine() {
 
   // ???冽?瑼Ｘ??
   chrome.tabs.remove(checkTab.id).catch(() => {});
-
-  // 開跑前先開 ScienceDirect：若有人機驗證讓使用者當場通過一次，
-  // clearance cookie 設好後，後續 Elsevier 論文較不會中途跳驗證
-  if (G.preVerifyElsevier && !G.stopped) {
-    await preVerifyPublisherChallenge();
-    if (G.stopped) { finishAll(); return; }
-  }
 
   await buildTabPool(G.concurrent);
 
@@ -1127,7 +1140,14 @@ async function runWorker(workerIdx) {
       failureReason = `⚠ 檔名重複：清理後標題與其他篇相同，本篇已存為「${downloadName}.pdf」（而非「${item.safeTitle}.pdf」）以避免覆蓋，請核對此列對應的 PDF 是否正確。`;
     }
 
-    G.resultsMap[item.rowIndex] = itemExcelStatus;
+    // 測試下載（G.testMode）完全不動 G.resultsMap／進度 Excel／Storage 完成紀錄、
+    // 也不去清另外兩個狀態資料夾的殘留——這些都是「正式進度」的一部分，測試下載
+    // 只是驗證某幾篇抓不抓得到 PDF，跟正式進度統計要完全分開。失敗 txt 診斷筆記
+    // 還是照寫（對除錯有用），只是 createFailureNote 內部已經把目的資料夾換成
+    // TEST_FOLDER_NAME，不會混進 下載失敗/下次重試。
+    if (!G.testMode) {
+      G.resultsMap[item.rowIndex] = itemExcelStatus;
+    }
     if (itemExcelStatus !== STATUS_SUCCESS) {
       const noteOk = await createFailureNote(
         item, itemExcelStatus, itemFolder, failureReason,
@@ -1136,7 +1156,7 @@ async function runWorker(workerIdx) {
       if (!noteOk) {
         workerLog(workerIdx, "  下載失敗 txt 產生失敗，請查看 thread log。", "fail");
       }
-    } else {
+    } else if (!G.testMode) {
       // 這篇可能在之前的執行中失敗過、留有舊的 下載失敗檔案/*.txt；
       // 這次成功了就順手清掉，避免使用者看到「明明成功卻還有失敗檔案」
       await removeStaleFailureNote(item, itemFolder);
@@ -1144,20 +1164,19 @@ async function runWorker(workerIdx) {
 
     // 本地資料夾模式：同一篇論文的檔案只能存在於 下載成功/下載失敗/下次重試 三個
     // 資料夾其中一個，這裡主動清掉另外兩個資料夾裡的同名殘留（跟上面 removeStaleFailureNote
-    // 是同一個概念，只是這裡是檔案系統版本、三個資料夾互相清）。
-    {
-      if (itemLocalCfg.enabled) {
-        const staleRelPaths = itemExcelStatus === STATUS_SUCCESS
-          ? [STATUS_FAIL + "/" + localFailureFilename(item, STATUS_FAIL) + ".txt",
-             STATUS_RETRY + "/" + localFailureFilename(item, STATUS_RETRY) + ".txt"]
-          : [STATUS_SUCCESS + "/" + localSuccessFilename(item) + ".pdf"];
-        fmRequest("delete_paths", { root: itemLocalCfg.root, relPaths: staleRelPaths }).catch(e => {
-          addThreadLog("Local mode stale-file cleanup failed", { error: e?.message || String(e), rowIndex: item.rowIndex });
-        });
-      }
+    // 是同一個概念，只是這裡是檔案系統版本、三個資料夾互相清）。測試下載不寫入這三個
+    // 資料夾，自然也不需要（也不該）清它們的東西。
+    if (!G.testMode && itemLocalCfg.enabled) {
+      const staleRelPaths = itemExcelStatus === STATUS_SUCCESS
+        ? [STATUS_FAIL + "/" + localFailureFilename(item, STATUS_FAIL) + ".txt",
+           STATUS_RETRY + "/" + localFailureFilename(item, STATUS_RETRY) + ".txt"]
+        : [STATUS_SUCCESS + "/" + localSuccessFilename(item) + ".pdf"];
+      fmRequest("delete_paths", { root: itemLocalCfg.root, relPaths: staleRelPaths }).catch(e => {
+        addThreadLog("Local mode stale-file cleanup failed", { error: e?.message || String(e), rowIndex: item.rowIndex });
+      });
     }
 
-    if (itemExcelStatus === STATUS_SUCCESS && item.pmid) {
+    if (!G.testMode && itemExcelStatus === STATUS_SUCCESS && item.pmid) {
       chrome.storage.local.get(["completedPmids"], data => {
         const set = new Set(data.completedPmids || []);
         set.add(String(item.pmid));
@@ -1166,11 +1185,24 @@ async function runWorker(workerIdx) {
     }
 
     G.done++;
- 
-    if (failureReason) {
+
+    if (!G.testMode && failureReason) {
       G.resultsFailMap = G.resultsFailMap || {};
       G.resultsFailMap[item.rowIndex] = failureReason;
     }
+
+    // 全域 log：讓使用者不用切到個別 Worker tab，就能在全域看到「哪個 worker
+    // 處理完第幾篇論文、結果是成功/失敗/重試」的總覽。paperNo 是整份 Excel 裡
+    // 「有資料的列」由上往下數的第幾篇（跟 localSuccessFilename() 檔名前綴用的
+    // seqLabel 是同一套順位，不論 Column M 是 Y 或 N 都算進去），所以跟檔名、核對
+    // 報告永遠對得起來，也不受斷點續傳/retry 篩選、或之後改動 Y/N 判斷影響；測試
+    // 下載模式走的是另一套查找邏輯，item 不會有 paperNo，退回顯示 Excel 列號。
+    const paperLabel = item.paperNo != null ? `第 ${item.paperNo} 篇` : `Excel 第 ${item.rowIndex} 列`;
+    addLog(
+      `[Worker ${workerIdx + 1}] ${paperLabel}（PMID:${item.pmid || "無"}）處理完成 → ${itemExcelStatus}`,
+      itemExcelStatus === STATUS_SUCCESS ? "ok" : itemExcelStatus === STATUS_RETRY ? "warn" : "fail"
+    );
+
     chrome.runtime.sendMessage({
       action: "RESULT_UPDATE", item, status: itemExcelStatus,
       resultsMap: G.resultsMap,
@@ -1250,12 +1282,100 @@ function decideFailureStatus(item, result, reason) {
   };
 }
 
+// ════════════════════════════════════════════════════════════════
+// Debug log 留痕機制：每次正式下載（測試下載不觸發）跑完，把這次執行的完整
+// logs/threadLogs/失敗筆記彙整成一個 txt，透過 file_manager native host 寫進
+// native_host/debug_log/（跟本地資料夾模式選的專案 root 無關，固定放在 host
+// 腳本旁邊，所以檔名要自己帶專案/Excel 名稱才分得出是哪次跑的）。資料夾裡最多
+// 留 20 個檔案，超過的由 native host 那邊依 mtime 砍最舊的。
+// ════════════════════════════════════════════════════════════════
+function formatDebugLogTime(ts) {
+  return new Date(ts).toLocaleString("zh-TW", { hour12: false });
+}
+
+function sanitizeDebugLogNamePart(s) {
+  const cleaned = String(s || "")
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, "_")
+    .trim()
+    .substring(0, 60);
+  return cleaned || "unknown";
+}
+
+function buildDebugLogText(runMeta) {
+  const run = G.debugRun || { logs: [], threadLogs: [], failureNotes: [], startedAt: Date.now() };
+  const lines = [];
+
+  lines.push("========================================");
+  lines.push("PubMed PDF 批次下載 - Debug Log");
+  lines.push("========================================");
+  lines.push("專案資料夾: " + (runMeta.projectFolder || "(未使用本地資料夾模式，走 Chrome 下載)"));
+  lines.push("Excel: " + (runMeta.excelBase || "(未知)"));
+  lines.push("開始時間: " + formatDebugLogTime(run.startedAt));
+  lines.push("結束時間: " + formatDebugLogTime(Date.now()));
+  lines.push("結果統計: 共 " + G.total + " 篇，成功 " + G.ok + "，失敗 " + G.fail + "，待重試 " + G.skip);
+  lines.push("");
+
+  lines.push("======== 摘要 Log（各 worker 處理過程，含中文說明）========");
+  run.logs.forEach(e => {
+    const w = e.workerIdx >= 0 ? `[Worker ${e.workerIdx + 1}] ` : "";
+    lines.push(`[${formatDebugLogTime(e.time)}] ${w}${e.msg}`);
+  });
+  lines.push("");
+
+  lines.push("======== 詳細技術追蹤（含每篇的連結/鎖/下載細節，走什麼路徑、定位哪個元件）========");
+  run.threadLogs.forEach(e => {
+    lines.push(`[${formatDebugLogTime(e.time)}] ${e.msg}` + (e.data ? "\n" + JSON.stringify(e.data, null, 2) : ""));
+  });
+  lines.push("");
+
+  lines.push("======== 失敗/重試筆記（本次執行期間產生過的失敗診斷內容，即使後來重跑成功、原本的 txt 被自動清掉，這裡仍保留）========");
+  if (!run.failureNotes.length) {
+    lines.push("（本次沒有產生任何失敗筆記）");
+  } else {
+    run.failureNotes.forEach((n, i) => {
+      lines.push(`---- 第 ${i + 1} 篇失敗筆記（Excel row ${n.rowIndex}, PMID ${n.pmid}, 狀態 ${n.status}）----`);
+      lines.push(n.body);
+      lines.push("");
+    });
+  }
+
+  return lines.join("\n");
+}
+
+async function writeDebugLogFile() {
+  if (G.testMode || !G.debugRun) return;
+  try {
+    const [localCfg, storageData] = await Promise.all([
+      getLocalFolderConfig(),
+      chrome.storage.local.get(["excelMeta"]),
+    ]);
+    const meta = storageData.excelMeta || {};
+    const projectFolder = (localCfg.enabled && localCfg.root)
+      ? localCfg.root.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
+      : (G.downloadFolder || meta.folder || "chrome_downloads");
+    const excelBase = (localCfg.enabled && localCfg.base) || meta.baseName || "unknown_excel";
+
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `debug_log_${sanitizeDebugLogNamePart(projectFolder)}_${sanitizeDebugLogNamePart(excelBase)}_${ts}.txt`;
+    const content = buildDebugLogText({ projectFolder, excelBase });
+
+    await fmRequest("write_debug_log", { filename, content, maxFiles: 20 });
+    addThreadLog("Debug log written", { filename });
+  } catch (e) {
+    // 沒裝 file_manager native host 或寫檔失敗都只記一筆 threadLog，不影響下載
+    // 流程本身——這是留痕的附加功能，不是下載能不能成功的必要條件。
+    addThreadLog("Debug log write failed (native host missing or error)", { error: e?.message || String(e) });
+  }
+}
+
 function finishAll() {
   G.running = false;
   G.tabPool = [];
   stopKeepAlive();
   addLog("\n全部完成：成功 " + G.ok + "，失敗 " + G.fail + "，未下載 " + G.skip, "ok");
 
+  writeDebugLogFile();
   triggerExcelWrite({ toDownload: true });
   // 本地資料夾模式：整批跑完後自動核對一次，抓出資料夾實際內容跟 Excel 狀態不一致
   // 的地方（例如某篇途中被中斷、寫檔失敗但沒正確回報）。這裡不是由 popup 發請求
@@ -1275,7 +1395,7 @@ function finishAll() {
   chrome.runtime.sendMessage({ action: "DONE", resultsMap: G.resultsMap }).catch(() => {});
   chrome.notifications.create({
     type:    "basic",
-    iconUrl: "icons/icon48.png",
+    iconUrl: chrome.runtime.getURL("icons/icon48.png"),
     title:   "PubMed 下載完成",
     message: "成功 " + G.ok + " 篇，失敗 " + G.fail + " 篇，未下載 " + G.skip + " 篇",
   });
@@ -1369,6 +1489,57 @@ async function appendNewRowsToLocalProject(newRawRows) {
   await _buildAndSaveExcel({ toDownload: true });
 
   return { ok: true, newTotal: ws.rowCount - 1 };
+}
+
+// 從既有專案資料夾讀回進度 Excel 時（OPEN_LOCAL_PROJECT 接續舊專案），把上一輪
+// 執行留下的黃色高亮（狀態欄的 fill，代表「上次那次執行有動過這列」）整欄清掉，
+// 只清 fill、不動文字顏色或內容——文字顏色才是持續累積的狀態紀錄（見
+// _buildAndSaveExcelImpl 開頭同樣的 YELLOW/NO_FILL 區分）。不這樣做的話，這次
+// 還沒開始跑，畫面上／磁碟上的 Excel 就已經有一批「看起來像剛處理過」的黃色列，
+// 跟這次執行實際處理的列混在一起，分不出哪些才是「這次」動過的。
+// 失敗就靜默回傳原始 b64，呼叫端當作沒清成功，不影響接續專案的主流程。
+async function stripStatusHighlightB64(b64, meta = {}) {
+  const ExcelJS = self.ExcelJS;
+  if (!ExcelJS || !b64) return b64;
+  try {
+    const binStr = atob(b64);
+    const buf = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buf.buffer);
+    const SHEET_NAME = meta.sheetName || workbook.worksheets[1]?.name || workbook.worksheets[0]?.name;
+    const ws = workbook.getWorksheet(SHEET_NAME) || workbook.worksheets[1] || workbook.worksheets[0];
+    if (!ws) return b64;
+
+    let statusCol = -1;
+    ws.getRow(1).eachCell((cell, colNum) => {
+      if (String(cell.value || "").trim() === "下載狀況") statusCol = colNum;
+    });
+    if (statusCol < 0) return b64;
+
+    const NO_FILL = { type: "pattern", pattern: "none" };
+    let cleared = 0;
+    ws.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+      const cell = row.getCell(statusCol);
+      if (cell.fill && cell.fill.pattern && cell.fill.pattern !== "none") {
+        cell.fill = NO_FILL;
+        cleared++;
+      }
+    });
+    if (!cleared) return b64;
+
+    const outBuf = await workbook.xlsx.writeBuffer();
+    const outArr = new Uint8Array(outBuf);
+    let bin = "";
+    const chunkSize = 8192;
+    for (let i = 0; i < outArr.length; i += chunkSize) bin += String.fromCharCode(...outArr.subarray(i, i + chunkSize));
+    addThreadLog("stripStatusHighlightB64: cleared stale yellow highlight", { rows: cleared });
+    return btoa(bin);
+  } catch (e) {
+    addThreadLog("stripStatusHighlightB64 failed", { error: e?.message || String(e) });
+    return b64;
+  }
 }
 
 // 所有真正的「讀 storage → 改 workbook → 寫回 storage/磁碟」都要走這個共用鎖排隊，
@@ -1585,23 +1756,87 @@ function parseLocalStem(folderName, stem) {
   return m ? { seq: m[1], statusWord: m[2], title: m[3] } : null;
 }
 
+// 以下欄位配置、seqLabel 算法必須跟 popup.js 的 buildAllRowsFromWorkbook() 保持完全
+// 一致，兩邊各自對同一份 Excel 算出來的序號才會對得起來（下載時的檔名前綴是 popup
+// 那邊算的，核對時如果這裡算出不同的序號，等於全部誤判）。
+const BG_COL_PMID  = 2;  // ExcelJS 1-based 欄號，對應 popup.js COL_PMID（0-based=1，欄 B）
+const BG_COL_TITLE = 3;  // 欄 C
+const BG_LOCAL_SEQ_WIDTH  = 4;  // 需跟 popup.js LOCAL_SEQ_WIDTH 保持一致
+
+function sanitizeFilenameBg(title) {
+  if (!title) return "untitled";
+  return String(title)
+    .replace(/[?/\\:*"<>|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 120);
+}
+
+// 核對要比對的是「Excel 本身」，不是任何時間點拍下來的快照——每次呼叫都直接從
+// chrome.storage.local 現存最新的 Excel bytes（跟 _buildAndSaveExcelImpl() 寫回的
+// 同一份 latestExcelB64）重新解析，確保拿到的永遠是目前為止最新的內容，不會因為
+// 「這次要下載的目標清單只是子集」或「拍照時間點太舊」而漏掉/誤判任何一列。
+async function buildAllRowsFromStorage() {
+  const data = await chrome.storage.local.get(["latestExcelB64", "sourceExcelB64", "excelMeta"]);
+  const b64 = data.latestExcelB64 || data.sourceExcelB64;
+  if (!b64) return [];
+
+  const ExcelJS = self.ExcelJS;
+  if (!ExcelJS) return [];
+
+  const meta = data.excelMeta || {};
+  const binStr = atob(b64);
+  const buf = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buf.buffer);
+  const SHEET_NAME = meta.sheetName || workbook.worksheets[1]?.name || workbook.worksheets[0]?.name;
+  const ws = workbook.getWorksheet(SHEET_NAME) || workbook.worksheets[1] || workbook.worksheets[0];
+  if (!ws) return [];
+
+  let statusCol = -1;
+  ws.getRow(1).eachCell((cell, colNum) => {
+    const v = String(cell.value || "").trim();
+    if (v === "下載狀況") statusCol = colNum;
+  });
+
+  const allRows = [];
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const pmidRaw  = row.getCell(BG_COL_PMID).value;
+    const titleRaw = row.getCell(BG_COL_TITLE).value;
+    const pmidStr  = pmidRaw != null ? String(pmidRaw).trim() : "";
+    const titleStr = titleRaw != null ? String(titleRaw).trim() : "";
+    if (!pmidStr && !titleStr) return;
+    const pmidNum = pmidStr ? parseInt(pmidStr, 10) : NaN;
+    const statusRaw = statusCol > 0 ? row.getCell(statusCol).value : null;
+    allRows.push({
+      rowIndex:  rowNumber,
+      pmid:      Number.isFinite(pmidNum) && pmidNum > 0 ? String(pmidNum) : null,
+      title:     titleStr,
+      safeTitle: sanitizeFilenameBg(titleStr),
+      status:    statusRaw != null ? String(statusRaw).trim() : "",
+    });
+  });
+
+  allRows.forEach((r, i) => {
+    r.seqLabel = String(i + 1).padStart(BG_LOCAL_SEQ_WIDTH, "0");
+  });
+
+  return allRows;
+}
+
 // 本地資料夾模式的核對：只計算差異，完全不寫入任何東西（不改 resultsMap、不刪檔、
 // 不動 Excel）。回傳的結構供 popup 呈現報告，使用者確認後才會呼叫
 // applyLocalFolderDiff() 真正套用。呼叫時機見 OPEN_LOCAL_PROJECT（接續舊專案）、
-// 整批下載跑完的收尾點、popup 的「🔄 核對進度」按鈕。
-//
-// rows：{rowIndex, title, safeTitle, seqLabel, status}[]，由 popup 傳（buildAllRowsFromWorkbook
-// 算出的全部列，含已經標記成功/失敗的列，核對本來就要看到全部列才有意義；每列的
-// seqLabel 是「這篇論文在整份 Excel 全部列中的固定順位」，補零到跟總篇數同寬，是
-// 本地資料夾模式命名/核對的唯一依據）；沒傳就退回用 G.targets（僅在同一個 session
-// 剛跑完一批時才有内容）。
-async function computeLocalFolderDiff(rows = null) {
+// 整批下載跑完的收尾點、popup 的「🔄 核對進度」按鈕——三個呼叫點都不用自己組列
+// 清單，一律由這裡當場重新讀 Excel 本身。
+async function computeLocalFolderDiff() {
   const cfg = await getLocalFolderConfig();
   if (!cfg.enabled) return { skipped: true, reason: "本地資料夾模式未開啟或未選擇資料夾" };
 
-  const rowList = (rows && rows.length) ? rows : (G.targets || []).map(t => ({
-    rowIndex: t.rowIndex, title: t.title, safeTitle: t.safeTitle, seqLabel: t.seqLabel, status: t.status,
-  }));
+  const rowList = await buildAllRowsFromStorage();
   if (!rowList.length) return { skipped: true, reason: "沒有可核對的列（尚未載入 Excel）" };
 
   const listed = await fmRequest("list_status_folders", { root: cfg.root });
@@ -1708,8 +1943,8 @@ async function computeLocalFolderDiff(rows = null) {
 // 手上那份可能已經過時的結果），把 mismatches/conflicts 兩桶的列寫回 resultsMap、
 // 刪掉 conflicts 標記要清的殘留檔，最後重新產生 Excel。anomalies 完全不動——那些
 // 檔案的歸屬需要人工判斷，不屬於「哪個資料夾為準」這種能自動決定的情況。
-async function applyLocalFolderDiff(rows = null) {
-  const diff = await computeLocalFolderDiff(rows);
+async function applyLocalFolderDiff() {
+  const diff = await computeLocalFolderDiff();
   if (diff.skipped) return diff;
 
   const cfg = await getLocalFolderConfig();
@@ -2835,12 +3070,6 @@ function restoreCmuProxyUrl(url) {
 // 失敗的那篇會從頭重跑。驗證通過的 clearance cookie 會留在瀏覽器，
 // 之後同站的下載就不會再被擋。
 
-// 驗證預熱用的固定測試文章（Elsevier/ScienceDirect）：拿它走一次完整取 PDF 流程
-// （文章頁 → 點 View PDF → PDF 檢視頁），確認是否會跳人機驗證，不會真的下載檔案
-const SD_PREVERIFY_PII = "S0965229918308379";
-const SD_PREVERIFY_ARTICLE_URL =
-  "https://www-sciencedirect-com.autorpa.cmu.edu.tw:8443/science/article/pii/" + SD_PREVERIFY_PII;
-
 async function waitForManualVerification(workerIdx = -1) {
   if (!G.verifyPending) return;
   workerLog(workerIdx, "  等待人機驗證完成中…", "warn");
@@ -3012,9 +3241,16 @@ const NATIVE_HEART_HOST = "com.pubmed_downloader.write_love";
 // 哪個元素」，不影響「有沒有偵測到人機驗證」本身的判斷（那個判斷邏輯不受這裡影響）。
 // 使用者可以在 popup 的「⚙ 驗證與 API 進階設定」裡換成常見類型之一，或自訂 selector，
 // 存在 chrome.storage.local 的 manualVerificationChallengeSelector。
+// [id^="cf-chl-widget-"]：Cloudflare Turnstile 實際渲染出的 widget 容器，不管網頁
+// 是用 .cf-turnstile 自動渲染還是像 ScienceDirect 那樣手動 turnstile.render('#別的id')，
+// 渲染完後都會生出這個 id 前綴的節點，比對 .cf-turnstile 這種「呼叫端指定的容器」更可靠。
+// iframe[src*='challenges.cloudflare.com']：真正的挑戰 iframe 網域，src 裡不會出現
+// 字面上的 "turnstile"，原本的 iframe[src*='turnstile'] 對這類頁面永遠配不到。
 const MANUAL_VERIFICATION_CHALLENGE_SELECTOR_DEFAULT =
   "#challenge-form, #cf-challenge-running, .cf-turnstile, .g-recaptcha, #px-captcha, " +
-  "iframe[src*='turnstile'], iframe[src*='recaptcha'], iframe[src*='hcaptcha']";
+  "[id^='cf-chl-widget-'], " +
+  "iframe[src*='turnstile'], iframe[src*='challenges.cloudflare.com'], " +
+  "iframe[src*='recaptcha'], iframe[src*='hcaptcha']";
 
 function getManualVerificationChallengeSelector() {
   return new Promise(resolve => {
@@ -3143,7 +3379,7 @@ async function activateVerificationEntry(entry) {
   try {
     chrome.notifications.create("manual-verify", {
       type: "basic",
-      iconUrl: "icons/icon128.png",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
       title: "PubMed 下載器：需要人機驗證",
       message: "請到剛開啟的分頁完成驗證。通過後會自動偵測並繼續下載；也可到擴充功能面板按「我已完成驗證」。",
       priority: 2,
@@ -3155,10 +3391,11 @@ async function activateVerificationEntry(entry) {
 }
 
 // 宣告需要人工驗證：暫停派發、開前景分頁（或沿用 existingTabId 的分頁）、
-// 通知使用者，並啟動自動偵測。force=true 時不受 manualVerifyPause 開關限制（驗證預熱用）
+// 通知使用者，並啟動自動偵測。force=true 時不受 manualVerifyPause 開關限制
+// （verify_test.js 的模擬測試用）。
 // preserveExistingTab=true：existingTabId 是 worker 的常駐背景分頁（tab pool 的一員），
 // 驗證結束後不能被關掉（否則該 worker 之後所有操作都會對著一個已關閉的 tabId 失敗）。
-// 只有「特地為了這次驗證開的用完即丟分頁」（LWW 中轉彈窗、預熱探測分頁）才該在
+// 只有「特地為了這次驗證開的用完即丟分頁」（LWW 中轉彈窗、測試靶場分頁）才該在
 // finishManualVerification 裡自動關閉，其餘一律保留、由呼叫端自行決定何時清理/導回 about:blank。
 //
 // 若同時有多筆驗證出現（多個 worker 同時撞到驗證頁），不會互相蓋過去或被漏掉：
@@ -3342,132 +3579,6 @@ function finishManualVerification(how) {
   chrome.runtime.sendMessage({ action: "VERIFY_OK" }).catch(() => {});
 }
 
-// 開跑前的 ScienceDirect 驗證預熱：拿固定測試文章走一次「與正式下載完全相同」的路徑
-// （文章頁 → 等 View PDF 連結出現 → 點擊 → 走到簽名 PDF / Chrome 內建 PDF 檢視頁），
-// 只差最後「按檢視頁的下載鈕存檔」那一步不做。單純 fetch 預檢 PDF 端點誘發不出挑戰，
-// 一定要真的用分頁點過去才會踩到 pdf.sciencedirectassets.com 上的驗證。
-// - 一路走到 PDF 檢視頁（或端點直接送出 PDF）→ 目前不需驗證，直接開跑
-// - 途中任一步出現人機驗證 → 暫停等使用者當場通過，clearance cookie 設好後開跑
-// - 時限內連結沒出現、也沒出現驗證頁 → 預熱未能觸發驗證，直接開跑，之後靠中途暫停機制
-async function preVerifyPublisherChallenge() {
-  addLog("驗證預熱：用測試文章走一次完整取 PDF 流程（到 PDF 檢視頁為止，不下載檔案）…", "info");
-  const tab = await chrome.tabs.create({ url: "about:blank", active: false }).catch(() => null);
-  if (!tab) {
-    addLog("驗證預熱：無法開啟分頁，略過。", "warn");
-    return;
-  }
-  // 預熱期間 worker 尚未啟動，此時出現的任何下載都是探測的副作用（例如 pdfft 端點
-  // 把測試 PDF 當附件送下來），一律取消並清掉紀錄，確保不真的存檔。
-  // 有攔到 PDF 附件也代表挑戰已放行，記下來當成功信號。
-  let sawIncidentalPdf = false;
-  const cancelPreverifyDownload = item => {
-    try {
-      if (/\.pdf(?:$|[?#])|pdf\.sciencedirectassets\.com|pdfft/i.test(item?.url || "") ||
-          /pdf/i.test(item?.mime || "")) {
-        sawIncidentalPdf = true;
-      }
-      chrome.downloads.cancel(item.id, () => {
-        void chrome.runtime.lastError;
-        chrome.downloads.erase({ id: item.id }, () => { void chrome.runtime.lastError; });
-      });
-      addThreadLog("Pre-verify: canceled incidental download", { url: item?.url || "" });
-    } catch {}
-  };
-  try { chrome.downloads.onCreated.addListener(cancelPreverifyDownload); } catch {}
-
-  // 途中偵測到驗證頁：沿用探測分頁開驗證流程、等使用者通過後放行開跑
-  const pauseAndWait = async where => {
-    addThreadLog("Pre-verify: manual verification detected", { where });
-    await requestManualVerificationPause(SD_PREVERIFY_ARTICLE_URL, "ScienceDirect 驗證預熱（" + where + "）", tab.id, true);
-    await waitForManualVerification(-1);
-    if (!G.stopped) {
-      addLog("驗證預熱：驗證流程結束，開始下載；途中若再遇驗證會自動暫停。", "ok");
-    }
-  };
-
-  try {
-    // 1) 文章頁：與正式流程相同的入口
-    await navigateAndWaitStable(tab.id, SD_PREVERIFY_ARTICLE_URL, 2500, 20000);
-    if (G.stopped) return;
-    if (await tabShowsManualVerification(tab.id) === true) { await pauseAndWait("文章頁"); return; }
-
-    // 2) 等 View PDF / pdfft 連結出現（ScienceDirect 經 proxy 可能渲染很慢），
-    //    輪詢期間同時盯著是否跳出驗證頁
-    let pdfHref = null;
-    const linkDeadline = Date.now() + 60000;
-    let nextVerifyCheck = 0;
-    while (!pdfHref && Date.now() < linkDeadline && !G.stopped) {
-      await sleep(700);
-      try {
-        const r = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: sel => {
-            const a = document.querySelector(sel);
-            return a ? new URL(a.getAttribute("href") || a.href, location.href).href : null;
-          },
-          args: [SD_PDF_LINK_SELECTOR]
-        });
-        pdfHref = r?.[0]?.result || null;
-      } catch {}
-      if (!pdfHref && Date.now() >= nextVerifyCheck) {
-        nextVerifyCheck = Date.now() + 4000;
-        if (await tabShowsManualVerification(tab.id) === true) { await pauseAndWait("文章頁"); return; }
-      }
-    }
-    if (G.stopped) return;
-    if (!pdfHref) {
-      addLog("驗證預熱：時限內沒等到 View PDF 連結、也未出現驗證頁；預熱未能觸發驗證，直接開始下載。", "warn");
-      addThreadLog("Pre-verify: no View PDF link within time limit", {});
-      return;
-    }
-
-    // 3) 點擊 View PDF（與正式流程同一顆按鈕），等分頁走到簽名 PDF / Chrome 內建
-    //    PDF 檢視頁。到達檢視頁就是預熱終點——檢視頁右上角的「下載」鈕不按。
-    addThreadLog("Pre-verify: clicking View PDF", { href: pdfHref });
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: sel => {
-        const link = document.querySelector(sel);
-        if (!link) return false;
-        link.setAttribute("target", "_self");
-        link.click();
-        return true;
-      },
-      args: [SD_PDF_LINK_SELECTOR]
-    }).catch(() => {});
-
-    const clickDeadline = Date.now() + 45000;
-    while (Date.now() < clickDeadline && !G.stopped) {
-      await sleep(700);
-      if (sawIncidentalPdf) {
-        addLog("驗證預熱：端點已直接送出 PDF（已取消不存檔），目前不需人機驗證，開始下載。", "ok");
-        addThreadLog("Pre-verify: PDF served as attachment, no challenge", {});
-        return;
-      }
-      const t = await chrome.tabs.get(tab.id).catch(() => null);
-      if (!t) return; // 分頁已被關（可能由驗證流程收走），交給後續中途機制
-      const curUrl = t.url || "";
-      if (/pdf\.sciencedirectassets\.com/i.test(curUrl) || /\/main\.pdf(?:$|[?#])/i.test(curUrl)) {
-        addLog("驗證預熱：已走到 PDF 檢視頁，未觸發人機驗證，開始下載。", "ok");
-        addThreadLog("Pre-verify: reached PDF viewer, no challenge", { url: curUrl });
-        return;
-      }
-      if (t.status !== "loading" && await tabShowsManualVerification(tab.id) === true) {
-        await pauseAndWait("PDF 端點");
-        return;
-      }
-    }
-    if (!G.stopped) {
-      addLog("驗證預熱：點擊 View PDF 後時限內未到達 PDF 檢視頁、也未出現驗證頁；直接開始下載，途中若遇驗證會自動暫停。", "warn");
-      addThreadLog("Pre-verify: click did not resolve within time limit", {});
-    }
-  } finally {
-    try { chrome.downloads.onCreated.removeListener(cancelPreverifyDownload); } catch {}
-    // 若分頁被當成驗證分頁，finishManualVerification 已關閉；重複關閉無害
-    chrome.tabs.remove(tab.id).catch(() => {});
-  }
-}
-
 async function recoverPdfFromRedirectLoop(tabId) {
   try {
     const r = await chrome.scripting.executeScript({
@@ -3555,6 +3666,7 @@ function localFailureFilename(item, status) {
 
 function getBatchFolderForIndex(idx) {
   const base = sanitizeDownloadFolder(G.downloadFolder || "PubMed_PDFs");
+  if (G.testMode) return base + "/" + TEST_FOLDER_NAME;
   const size = Math.max(0, parseInt(G.batchSize || 0, 10) || 0);
   if (!size) return base;
   const start = Math.floor(idx / size) * size + 1;
@@ -3684,11 +3796,21 @@ async function createFailureNote(item, status, folder, reason = "", fullTextLink
     ...downloadAttemptsSection,
     ...procSection
   ].join("\n");
+
+  // 這篇失敗筆記的完整內容留一份進 debugRun：這個 txt 之後若這篇改天重跑成功，
+  // 會被 removeStaleFailureNote() 自動清掉，磁碟上就再也找不到當初失敗的細節；
+  // debugRun 這份不受那個清理邏輯影響，寫進本次 debug log 後就是永久紀錄。
+  if (G.debugRun) {
+    G.debugRun.failureNotes.push({ time: Date.now(), rowIndex: item.rowIndex, pmid, status, body });
+  }
+
   // 本地資料夾模式：STATUS_FAIL/STATUS_RETRY 的字串本來就跟「下載失敗」「下次重試」
   // 這兩個子資料夾同名，直接拿 status 當資料夾名稱用，寫檔完全繞過 chrome.downloads。
   const localCfg = await getLocalFolderConfig();
   if (localCfg.enabled) {
-    const localFolderName = (status === STATUS_FAIL || status === STATUS_RETRY) ? status : STATUS_FAIL;
+    const localFolderName = G.testMode
+      ? TEST_FOLDER_NAME
+      : ((status === STATUS_FAIL || status === STATUS_RETRY) ? status : STATUS_FAIL);
     // 本地資料夾模式的檔名要用序號前綴（見 localFailureFilename），才能在核對時直接
     // 從檔名反推對到 Excel 哪一列；item.seqLabel 缺失時（理論上不會發生）退回舊式
     // 純標題命名，至少不會整篇寫檔失敗。
@@ -4357,7 +4479,7 @@ async function downloadViaPageTriggeredDownload(tabId, pageUrl, safeTitle, folde
             await fmRequest("move_file", {
               sourceAbsPath: it.filename,
               root: localCfg.root,
-              destRelPath: STATUS_SUCCESS + "/" + safeTitle + ".pdf",
+              destRelPath: (G.testMode ? TEST_FOLDER_NAME : STATUS_SUCCESS) + "/" + safeTitle + ".pdf",
             });
             rec("已搬移至本地專案資料夾");
           } catch (e) {
@@ -4467,7 +4589,7 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
       }
       await fmRequest("write_bytes", {
         root: localCfg.root,
-        relPath: STATUS_SUCCESS + "/" + safeTitle + ".pdf",
+        relPath: (G.testMode ? TEST_FOLDER_NAME : STATUS_SUCCESS) + "/" + safeTitle + ".pdf",
         dataB64: bufferToBase64(buf),
       });
       rec("結果：下載成功（本地資料夾模式）");
@@ -4630,7 +4752,7 @@ async function downloadBase64Pdf(base64, safeTitle, folder = "PubMed_PDFs", trac
     try {
       await fmRequest("write_bytes", {
         root: localCfg.root,
-        relPath: STATUS_SUCCESS + "/" + safeTitle + ".pdf",
+        relPath: (G.testMode ? TEST_FOLDER_NAME : STATUS_SUCCESS) + "/" + safeTitle + ".pdf",
         dataB64: base64,
       });
       rec("下載成功（本地資料夾模式）");

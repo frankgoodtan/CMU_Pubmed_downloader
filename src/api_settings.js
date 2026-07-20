@@ -20,7 +20,6 @@ const AdvancedSettings = (() => {
   const summary   = document.getElementById("advancedSummary");
   const fieldsHost = document.getElementById("publisherApiFields");
   const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
-  const preVerifyInput         = document.getElementById("preVerifyInput");
   const challengeSelectorPreset = document.getElementById("challengeSelectorPreset");
   const challengeSelectorCustom = document.getElementById("challengeSelectorCustom");
   const allowChromeDownloadsFallbackInput = document.getElementById("allowChromeDownloadsFallbackInput");
@@ -125,7 +124,6 @@ const AdvancedSettings = (() => {
     if (!summary) return;
     const parts = [];
     parts.push("暫停等驗證：" + (manualVerifyPauseInput?.checked ? "開" : "關"));
-    parts.push("SD 預熱：" + (preVerifyInput?.checked ? "開" : "關"));
     const configured = publisherApiConfiguredLabels(getCreds());
     parts.push("API：" + (configured.length ? configured.join("+") : "未設定"));
     parts.push("失敗退回 Chrome 下載：" + (allowChromeDownloadsFallbackInput?.checked ? "開" : "關"));
@@ -153,9 +151,7 @@ const AdvancedSettings = (() => {
       updateSummary();
     });
   }
-  [manualVerifyPauseInput, preVerifyInput].forEach(el => {
-    el?.addEventListener("change", updateSummary);
-  });
+  manualVerifyPauseInput?.addEventListener("change", updateSummary);
   allowChromeDownloadsFallbackInput?.addEventListener("change", () => { save(); updateSummary(); });
   challengeSelectorPreset?.addEventListener("change", () => {
     toggleChallengeSelectorCustomInput();

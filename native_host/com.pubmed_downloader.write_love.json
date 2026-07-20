@@ -1,9 +1,0 @@
-﻿{
-    "name":  "com.pubmed_downloader.write_love",
-    "description":  "PubMed PDF Downloader - draw a heart when manual verification is detected",
-    "path":  "C:\\Users\\user\\Desktop\\自動載pubmed論文擴充\\pubmed_pdf_downloader_v6.9c\\pubmed_pdf_downloader_v6.9c\\chrome_extension\\native_host\\python_write_love.bat",
-    "type":  "stdio",
-    "allowed_origins":  [
-                            "chrome-extension://ngkjkkofhbbemmjobfifbifigkijbpbo/"
-                        ]
-}

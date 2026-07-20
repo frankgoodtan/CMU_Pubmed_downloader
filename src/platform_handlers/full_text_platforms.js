@@ -378,8 +378,7 @@ async function getPdfFromJama(tabId, url) {
   return null;
 }
 
-// ScienceDirect「View PDF / Download PDF」連結的選擇器；
-// 正式下載流程與 background.js 的驗證預熱共用，確保兩邊點的是同一顆按鈕
+// ScienceDirect「View PDF / Download PDF」連結的選擇器
 const SD_PDF_LINK_SELECTOR =
   "li.ViewPDF a[href*='/pdfft'], " +
   "a[aria-label*='View PDF'][href*='/pdfft'], " +

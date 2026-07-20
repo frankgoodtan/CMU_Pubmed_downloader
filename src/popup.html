@@ -279,6 +279,40 @@
       padding: 10px 14px; border-top: 1px solid #e5e7eb; display: flex;
       justify-content: flex-end;
     }
+
+    /* ── 起始/結束論文選擇器（可搜尋的彈出視窗，由 openPaperPicker() 控制）── */
+    .picker-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(15,23,42,0.55);
+      z-index: 1100; align-items: center; justify-content: center; padding: 16px;
+    }
+    .picker-overlay.show { display: flex; }
+    .picker-panel {
+      background: #fff; border-radius: 8px; width: 100%; max-width: 480px;
+      max-height: 80vh; display: flex; flex-direction: column;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+    }
+    .picker-panel-header {
+      padding: 12px 14px; border-bottom: 1px solid #e5e7eb;
+      background: #eef2ff; border-radius: 8px 8px 0 0;
+    }
+    .picker-panel-header strong { color: #3730a3; font-size: 13px; display: block; margin-bottom: 6px; }
+    .picker-search {
+      width: 100%; box-sizing: border-box; padding: 5px 8px; border: 1px solid #c7d2fe;
+      border-radius: 4px; font-size: 12px; font-family: inherit;
+    }
+    .picker-panel-body { padding: 6px 8px; overflow-y: auto; flex: 1; }
+    .picker-empty { padding: 10px; font-size: 12px; color: #6b7280; text-align: center; }
+    .picker-item {
+      padding: 6px 8px; border-radius: 4px; cursor: pointer; font-size: 12px;
+      line-height: 1.4; border: 1px solid transparent;
+    }
+    .picker-item:hover { background: #eef2ff; border-color: #c7d2fe; }
+    .picker-item .picker-item-seq { color: #6366f1; font-weight: 700; margin-right: 4px; }
+    .picker-item .picker-item-pmid { color: #64748b; margin-right: 4px; }
+    .picker-panel-footer {
+      padding: 10px 14px; border-top: 1px solid #e5e7eb; display: flex;
+      justify-content: flex-end;
+    }
   </style>
 </head>
 <body>
@@ -457,13 +491,9 @@
   </div>
   <div id="advancedPanel" style="display:none; background:#f8fafc; border-bottom:1px solid #e2e8f0; padding:10px 14px;">
     <div style="font-weight:700; font-size:12px; color:#334155; margin-bottom:6px;">🤖 人機驗證</div>
-    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; margin-bottom:4px;">
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
       <input type="checkbox" id="manualVerifyPauseInput" checked>
       <span>遇驗證時暫停等我通過</span>
-    </label>
-    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
-      <input type="checkbox" id="preVerifyInput" checked>
-      <span>開始前用測試文章探測 ScienceDirect 驗證（不下載檔案）</span>
     </label>
 
     <div style="margin-top:10px;">
@@ -514,12 +544,18 @@
   </div>
   <div class="settings-row" id="startFromRow">
     <label>起始 PMID/title</label>
-    <input type="text" id="startFromInput" class="wide-input" placeholder="留空 = 從頭開始；填 PMID 或標題關鍵字可從中間繼續">
+    <input type="text" id="startFromInput" class="wide-input" placeholder="留空 = 從頭開始；填 PMID 或標題關鍵字">
+    <button type="button" id="startFromBrowseBtn">🔍 瀏覽</button>
+  </div>
+  <div class="settings-row" id="endAtRow">
+    <label>結束 PMID/title</label>
+    <input type="text" id="endAtInput" class="wide-input" placeholder="留空 = 到最後一篇；填 PMID 或標題關鍵字">
+    <button type="button" id="endAtBrowseBtn">🔍 瀏覽</button>
   </div>
   <div class="settings-row" id="stopAfterRow">
     <label>處理後停止</label>
     <input type="number" id="stopAfterInput" min="0" value="200" placeholder="例如 100" style="width:70px;">
-    <span class="delay-note">0 = 不限制；設 n 時，完成 n 篇（成功＋失敗均計）後自動停止（保守模式預設 200）</span>
+    <span class="delay-note">在「起始～結束」範圍內，再加一道保守上限：0 = 不限制；設 n 時，這次範圍最多處理 n 篇（成功＋失敗均計）後自動停止</span>
   </div>
 
   <!-- 測試工具（Debug 用，統一收合；預設不觸發任何動作，按下小按鈕才展開） -->
@@ -692,6 +728,20 @@
       <div class="diff-panel-footer">
         <button type="button" id="diffCancelBtn" class="diff-btn diff-btn-cancel">取消</button>
         <button type="button" id="diffApplyBtn" class="diff-btn diff-btn-apply">✅ 同步更新</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 起始/結束論文選擇器（預設隱藏，由 openPaperPicker() 控制；「🔍 瀏覽」按鈕觸發）-->
+  <div id="paperPickerOverlay" class="picker-overlay">
+    <div class="picker-panel">
+      <div class="picker-panel-header">
+        <strong id="paperPickerTitle">選擇論文</strong>
+        <input type="text" id="paperPickerSearch" class="picker-search" placeholder="輸入 PMID 或標題關鍵字篩選…">
+      </div>
+      <div class="picker-panel-body" id="paperPickerList"></div>
+      <div class="picker-panel-footer">
+        <button type="button" id="paperPickerCancelBtn" class="diff-btn diff-btn-cancel">取消</button>
       </div>
     </div>
   </div>

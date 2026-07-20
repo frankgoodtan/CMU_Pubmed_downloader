@@ -105,6 +105,22 @@ async function locateAllTargetElements(tabId, selector, options) {
           const rect = el.getBoundingClientRect();
           return rect.width > minW && rect.height > minH;
         };
+        // document.querySelectorAll 不會穿透 shadow root，但 Cloudflare Turnstile
+        // 等挑戰元件常把實際渲染出的 iframe/容器包在（open）shadow root 裡再插進
+        // DOM，只查 document 這一層常常直接漏掉。這裡改成遞迴：先查目前這層，再
+        // 對每個有 shadowRoot 的節點往下查同一組 selector，結果合併去重。
+        const deepQuerySelectorAll = (root, selector) => {
+          const found = new Set(Array.from(root.querySelectorAll(selector)));
+          const all = root.querySelectorAll("*");
+          for (const el of all) {
+            if (el.shadowRoot) {
+              for (const nested of deepQuerySelectorAll(el.shadowRoot, selector)) {
+                found.add(nested);
+              }
+            }
+          }
+          return Array.from(found);
+        };
         // getBoundingClientRect()／innerWidth／innerHeight 永遠是 CSS 像素（網頁
         // 標準規定，不受 Windows 顯示縮放影響），這裡直接原樣回傳、不要提早換算
         // ——chrome.windows.get() 拿到的 windowInfo 實測也是 CSS 像素，兩者單位
@@ -112,7 +128,7 @@ async function locateAllTargetElements(tabId, selector, options) {
         // 是實體螢幕座標）時，才在 rectToScreenPoint() 裡一次性乘上
         // devicePixelRatio。dpr 隨 rect 一起帶出去，讓那裡拿得到這個縮放比例。
         const dpr = window.devicePixelRatio || 1;
-        return Array.from(document.querySelectorAll(sel)).filter(isUsable).map((el) => {
+        return deepQuerySelectorAll(document, sel).filter(isUsable).map((el) => {
           const rect = el.getBoundingClientRect();
           const firstClass = el.className && typeof el.className === "string" ? el.className.trim().split(/\s+/)[0] : "";
           const matched = el.id ? ("#" + el.id) : (firstClass ? ("." + firstClass) : el.tagName.toLowerCase());
