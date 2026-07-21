@@ -6,29 +6,43 @@
  * sinupret drops to treat radiation nasosinusitis]」），這類論文在 PubMed 上走
  * 原本流程（PMID 直達 / title 搜尋 → Full Text link → 各出版商 PDF 解析）常常
  * 找不到全文。這個檔案負責在原本 PubMed 流程「之前」，先用 Excel L 欄（DOI）
- * 到中國知網海外版（CNKI，經 CMU EZproxy）用 DOI 精確搜尋、下載 PDF。
+ * 到中國知網海外版（CNKI，經 CMU EZproxy）下載 PDF。
  *
  * 判定「是不是中文期刊」的方式：只看 Title 整個是不是被「[ ]」框住（見
- * isBracketedChineseTitle），不再檢查 Excel 語言欄（S 欄）。
+ * isBracketedChineseTitle），不再檢查 Excel 語言欄（S 欄）。Excel 裡的 Title
+ * 是 PubMed 的英文翻譯標題，不是中文原始篇名，所以不能拿它去 CNKI 用篇名搜尋
+ * （搜不到），只能靠 DOI 查找目標文章。
  *
- * 查詢＋下載流程（呼叫時機見 background.js 的 getPdfUrlWithFallback）：
+ * 查詢方式的演進：原本直接組 CNKI 一框式搜尋「DOI 精確搜尋」網址（搜尋欄位選
+ * DOI、貼 DOI），但實測發現 CNKI 這個 DOI 欄位的比對邏輯是 bug：一框式搜尋用
+ * PREFIX（前綴）比對，範圍過寬，會把整本期刊的文章都撈出來（例如查一篇文章的
+ * DOI 卻跑出 17,841 筆結果）；高級檢索的「精確」模式又常常 0 筆（索引沒對上）。
+ * 因此改用 CNKI 官方 DOI 解析服務（www.chndoi.org）來精確定位文章，不再依賴
+ * CNKI 搜尋框：
  *   1. 先進中國知網海外版入口（CNKI_PORTAL_URL），確保 EZproxy 對這個資源已有 session
  *      （沿用 background.js 既有的 CMU EZproxy 登入狀態，非各自獨立登入）。
- *   2. 直接組出「以 DOI 精確搜尋」的結果頁網址（CNKI 首頁把搜尋欄位從預設的
- *      「主題」改選「DOI」、貼上 DOI、按搜尋鍵之後，實際導向的就是這個網址結構；
- *      直接組網址等同模擬這個操作，且不必處理「按下搜尋鍵後開新分頁」的不確定性）。
- *   3. DOI 是精確查詢鍵，正常應該剛好 1 筆結果（讀 #totalCnt）；0 筆視為找不到、
- *      2 筆以上視為不符預期，兩者都直接回報失敗、不繼續往下走。
- *   4. 剛好 1 筆時，點擊結果列的文章標題連結（target="_blank"，開新分頁）進入
- *      文章頁，再點文章頁最下面的「下載」按鈕（a.btn-download-logo）觸發下載。
- *      這裡刻意都用「真的點擊 DOM 元素」而不是直接組網址 fetch/導航：CNKI 的
- *      下載端點會檢查 Referer 是不是真的從自己的頁面點過去的（不是就回傳
- *      「來源應用不正確」的假 HTML 錯誤頁），只有搜尋頁 → 文章頁 → 下載按鈕
- *      這條真實點擊鏈才會帶對 Referer。
+ *   2. 用 fetch 打 https://www.chndoi.org/Resolution/Handler?doi={DOI}，這是
+ *      CNKI 官方的 DOI 解析服務（不需要登入、不吃 EZproxy session），回傳的頁面
+ *      是「多重解析地址選擇頁面」，列出題名/作者/DOI 供核對，並提供「境內」
+ *      （link.cnki.net）與「境外」（link.oversea.cnki.net）兩個連結。我們只需要
+ *      「境外」那個連結（見 resolveOverseaArticleHrefViaChndoi）。
+ *   3. 那個「境外」連結是原始網域（https://link.oversea.cnki.net/doi/{DOI}），
+ *      不能直接拿去導航——CNKI 認的是「請求真的經過 CMU 這台 EZproxy」，不是
+ *      cookie，直連原始網域會被當一般訪客，導向 CNKI 自家帳號登入頁（不是
+ *      CMU 登入頁）。所以要先轉成跟 CNKI_PORTAL_URL 同一套轉換規則的代理網址
+ *      （「.」換成「-」、接上 .autorpa.cmu.edu.tw:8443，見 toEzproxyCnkiUrl），
+ *      再開新分頁導過去。這個代理連結本身會自動跳轉到最終的文章頁
+ *      （oversea-cnki-net.autorpa.cmu.edu.tw:8443/kcms2/article/abstract?...），
+ *      沿用步驟 1 建立的 EZproxy session 即可直接看到完整文章內容。
+ *   4. 在文章頁點最下面的「下載」按鈕（a.btn-download-logo）展開選單，再點選單
+ *      裡的 PDF 連結（a#pdfDown）觸發下載。這裡刻意都用「真的點擊 DOM 元素」而
+ *      不是直接組網址 fetch/導航：CNKI 的下載端點會檢查 Referer 是不是真的從
+ *      自己的文章頁點過去的（不是就回傳「來源應用不正確」的假 HTML 錯誤頁）。
  *   5. 用 chrome.downloads.onDeterminingFilename 攔截點擊觸發的原生下載，改存到
  *      呼叫端指定的資料夾/檔名；下載完成後檢查內容不是 HTML 假檔才算成功。
- *   6. 任何一步失敗（缺 DOI、搜尋 0/2+ 筆、逾時、下載內容是假檔等）都視為失敗，
- *      呼叫端會 fallback 回原本 PubMed 流程，不會讓整篇直接判定失敗。
+ *   6. 任何一步失敗（缺 DOI、chndoi.org 解析不到境外連結、逾時、下載內容是假檔
+ *      等）都視為失敗，呼叫端會 fallback 回原本 PubMed 流程，不會讓整篇直接
+ *      判定失敗。
  *
  * 這個檔案只給 background.js（service worker）用，透過 importScripts 載入，
  * 共用 background.js 裡的全域工具函式與 API（sleep、navigateTab、
@@ -37,15 +51,15 @@
  * getPendingDownloadFilename、chrome.downloads/chrome.tabs 等）。
  *
  * ── Debug 訊息 ──
- * 這個流程外部（CNKI 網站/EZproxy）不受我們控制，容易因為頁面改版、登入逾時、
- * DOI 沒命中、下載按鈕選擇器跟預期不同等原因悄悄失敗，所以每個關鍵步驟都留了
- * 兩層紀錄：
+ * 這個流程外部（CNKI 網站/chndoi.org/EZproxy）不受我們控制，容易因為頁面改版、
+ * 登入逾時、解析頁結構變動、下載按鈕選擇器跟預期不同等原因悄悄失敗，所以每個
+ * 關鍵步驟都留了兩層紀錄：
  *   1. addThreadLog(...)：寫進 thread log（背景詳細紀錄，THREAD_LOG 訊息），
  *      即時追蹤用，包含目前網址、輪詢次數、頁面診斷等細節。
  *   2. rec(...)（透過呼叫端傳入的 trace 陣列）：寫進「本篇處理過程紀錄」，
  *      這篇論文若最終判定失敗，這些紀錄會整段附加到「下載失敗檔案/*.txt」
  *      末尾，讓使用者不用另外去翻 thread log 就能看到 CNKI 那段到底發生什麼事、
- *      卡在哪一步（進入知網 / 確認搜尋筆數 / 點文章連結 / 點下載按鈕 / 攔截下載）。
+ *      卡在哪一步（進入知網 / DOI 解析 / 點文章連結 / 點下載按鈕 / 攔截下載）。
  * 失敗時回傳的 failureReason 也會被 background.js 疊進 linkAttempts，
  * 即使之後又 fallback 回 PubMed 流程、PubMed 那邊也失敗，CNKI 這次嘗試的
  * 原因依然會出現在下載失敗 txt 的「連結嘗試紀錄」區塊，不會被蓋掉或遺失。
@@ -54,13 +68,10 @@
 // 中國知網海外版入口（經 CMU EZproxy）；先訪問這個網址，確保 EZproxy 已對此資源建立 session
 const CNKI_PORTAL_URL = "http://oversea-cnki-net.autorpa.cmu.edu.tw:8080/tra/";
 
-// DOI 精確搜尋結果頁（同 CNKI 首頁把搜尋欄改選 DOI、輸入 DOI、按搜尋鍵之後導向的網址）
-const CNKI_SEARCH_BASE = "https://oversea-cnki-net.autorpa.cmu.edu.tw:8443/kns8s/defaultresult/index";
-
-// 「總庫」跨庫檢索的預設資料庫分類代碼（對應 CNKI 首頁預設勾選的學術期刊/學位論文/
-// 會議論文/報紙/年鑑/輯刊/圖書/標準/成果/特色期刊；不含專利，跟首頁預設一致）
-const CNKI_DEFAULT_CROSSIDS =
-  "ON8XK5WL,B7ZYGRCM,BT8YKI4I,TBRPZP83,4SCRTXA2,SZU0GLDC,I8IOAWAD,HT3U9UVL,BHWTLLXZ,IAF5Y951";
+// CNKI 官方 DOI 解析服務：不吃 EZproxy session、不需要登入，直接回傳「多重解析
+// 地址選擇頁面」（題名/作者/DOI + 境內/境外連結），比 CNKI 搜尋框的 DOI 欄位
+// （PREFIX 比對 bug，見檔案開頭說明）精確可靠。
+const CNKI_DOI_RESOLVER_BASE = "https://www.chndoi.org/Resolution/Handler";
 
 // 判斷一篇論文是否為中文期刊：PubMed 的 Title 整個被「[ ]」框住即視為中文期刊
 // （PubMed 慣例：非英文標題會用中括號框住英文翻譯標題）
@@ -69,13 +80,43 @@ function isBracketedChineseTitle(item) {
   return title.length > 2 && title.startsWith("[") && title.endsWith("]");
 }
 
-function buildCnkiDoiSearchUrl(doi) {
-  const params = new URLSearchParams();
-  params.set("crossids", CNKI_DEFAULT_CROSSIDS);
-  params.set("language", "cht");
-  params.set("korder", "DOI");
-  params.set("kw", doi);
-  return CNKI_SEARCH_BASE + "?" + params.toString();
+function buildChndoiResolverUrl(doi) {
+  return CNKI_DOI_RESOLVER_BASE + "?doi=" + encodeURIComponent(doi);
+}
+
+// 把原始 CNKI 網域網址轉成 CMU EZproxy 代理過的網址（「.」換成「-」、接上
+// .autorpa.cmu.edu.tw:8443），跟 CNKI_PORTAL_URL 用的是同一套轉換規則。
+// 直接訪問原始網域（例如 oversea.cnki.net）不會帶到 CMU 的機構授權——CNKI
+// 是看「請求真的經過 CMU 這台 EZproxy」才放行，不是看 cookie；跳過 proxy
+// 直連原始網域會被當成一般訪客，導向 CNKI 自家帳號登入頁。所以 chndoi.org
+// 解析出來的「境外」連結（原始網域）一定要轉成這個代理網址再導航過去。
+function toEzproxyCnkiUrl(rawUrl) {
+  const u = new URL(rawUrl);
+  const proxiedHost = u.hostname.replace(/\./g, "-") + ".autorpa.cmu.edu.tw";
+  return "https://" + proxiedHost + ":8443" + u.pathname + u.search + u.hash;
+}
+
+// 打 chndoi.org DOI 解析服務，從回傳的「多重解析地址選擇頁面」HTML 裡抓出
+// 「境外」（link.oversea.cnki.net）連結，並轉成 EZproxy 代理網址。
+// 回傳 { ok, href?, reason?, url }。
+async function resolveOverseaArticleHrefViaChndoi(doi) {
+  const url = buildChndoiResolverUrl(doi);
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    return { ok: false, reason: "chndoi.org DOI 解析服務連線失敗：" + (e?.message || String(e)), url };
+  }
+  if (!resp.ok) {
+    return { ok: false, reason: "chndoi.org DOI 解析服務回應異常，HTTP " + resp.status, url };
+  }
+  const html = await resp.text();
+  const match = html.match(/<a href="(https:\/\/link\.oversea\.cnki\.net\/doi\/[^"]+)">[^<]*<\/a>\s*\(境外\)/);
+  if (!match) {
+    return { ok: false, reason: "chndoi.org DOI 解析頁未找到「境外」連結，可能查無此 DOI 或頁面結構已變動", url };
+  }
+  const ezproxyHref = toEzproxyCnkiUrl(match[1]);
+  return { ok: true, href: ezproxyHref, rawHref: match[1], url };
 }
 
 // 中文論文查詢流程主入口（含下載）。
@@ -142,87 +183,22 @@ async function runChineseSearchAndDownload(tabId, item, doi, pmid, workerIdx, tr
   }
   report.enteredPortal = stageResult(true, "已進入 CNKI 入口：" + CNKI_PORTAL_URL);
 
-  const searchUrl = buildCnkiDoiSearchUrl(doi);
-  workerLog(workerIdx, "  CNKI 以 DOI 搜尋：" + doi, "info");
-  rec("組出 DOI 搜尋網址：" + searchUrl);
-  addThreadLog("Chinese paper search: navigating to DOI search URL", { doi, searchUrl });
+  workerLog(workerIdx, "  透過 chndoi.org 解析 DOI：" + doi, "info");
+  const resolved = await resolveOverseaArticleHrefViaChndoi(doi);
+  rec("呼叫 chndoi.org DOI 解析：" + resolved.url);
+  addThreadLog("Chinese paper search: chndoi.org resolution attempted", { doi, url: resolved.url, ok: resolved.ok });
 
-  try {
-    await navigateAndWaitStable(tabId, searchUrl, 2500, 20000);
-    rec("搜尋結果頁載入完成");
-  } catch (e) {
-    const msg = e?.message || String(e);
-    const reason = "CNKI 搜尋結果頁導航失敗：" + msg;
-    report.doiFound = stageResult(false, reason);
-    rec(reason);
-    addThreadLog("Chinese paper search: search navigation failed", { doi, searchUrl, error: msg });
-    return { pdfUrl: null, downloaded: false, failureReason: reason, report };
+  if (!resolved.ok) {
+    report.doiFound = stageResult(false, resolved.reason);
+    rec(resolved.reason);
+    addThreadLog("Chinese paper search: chndoi.org resolution failed", { doi, reason: resolved.reason });
+    return { pdfUrl: null, downloaded: false, failureReason: resolved.reason, report };
   }
 
-  // 結果列表可能要一點時間才渲染完，輪詢確認搜尋結果筆數。DOI 是精確查詢鍵，
-  // 正常應該剛好 1 筆；0 筆或 2 筆以上都不符合預期，直接回報、不繼續往下點。
-  const countDeadline = Date.now() + 30000;
-  let pollCount = 0;
-  let lastScriptError = "";
-  let articleHref = null;
-  while (Date.now() < countDeadline) {
-    pollCount++;
-    try {
-      const r = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const totalCntEl = document.getElementById("totalCnt");
-          const total = totalCntEl ? parseInt(totalCntEl.value, 10) : NaN;
-          if (!Number.isFinite(total)) {
-            return { pending: true, url: location.href };
-          }
-          const link = document.querySelector("table.result-table-list a.fz14.inline[href]");
-          return { total, href: link ? link.getAttribute("href") : null, url: location.href };
-        }
-      });
-      const result = r?.[0]?.result;
-      if (result && Number.isFinite(result.total)) {
-        if (result.total === 0) {
-          const reason = "CNKI 以 DOI 搜尋無結果：" + doi;
-          report.doiFound = stageResult(false, reason + "（搜尋網址：" + searchUrl + "）");
-          rec(reason);
-          addThreadLog("Chinese paper search: zero results", { doi, searchUrl });
-          return { pdfUrl: null, downloaded: false, failureReason: reason, report };
-        }
-        if (result.total > 1) {
-          const reason = "CNKI 以 DOI 搜尋出現 " + result.total + " 筆結果，不符合預期（DOI 應精確對應 1 篇），已略過此篇，請人工確認。";
-          report.doiFound = stageResult(false, reason + "（搜尋網址：" + searchUrl + "）");
-          rec(reason);
-          addThreadLog("Chinese paper search: multiple results (unexpected)", { doi, searchUrl, total: result.total });
-          return { pdfUrl: null, downloaded: false, failureReason: reason, report };
-        }
-        // total === 1：找到剛好 1 筆，抓文章連結；連結可能還沒渲染出來，繼續輪詢
-        if (result.href) { articleHref = result.href; break; }
-      }
-      if (pollCount === 1 || pollCount % 5 === 0) {
-        addThreadLog("Chinese paper search: still polling for result count", {
-          doi, pollCount, currentUrl: result?.url || ""
-        });
-      }
-    } catch (e) {
-      lastScriptError = e?.message || String(e);
-    }
-    await sleep(500);
-  }
-
-  if (!articleHref) {
-    const reason = "CNKI 搜尋結果頁逾時（30 秒），未能確認結果筆數或找到文章連結。" +
-      (lastScriptError ? "最後一次讀取頁面時發生錯誤：" + lastScriptError + "；" : "") +
-      "搜尋網址：" + searchUrl;
-    report.doiFound = stageResult(false, reason);
-    rec(reason);
-    addThreadLog("Chinese paper search: timed out confirming result count", { doi, searchUrl, lastScriptError, pollCount });
-    return { pdfUrl: null, downloaded: false, failureReason: reason, report };
-  }
-
-  report.doiFound = stageResult(true, "確認搜尋結果剛好 1 筆，文章連結：" + articleHref);
-  rec("確認搜尋結果剛好 1 筆，文章連結：" + articleHref);
-  addThreadLog("Chinese paper search: confirmed single result", { doi, articleHref });
+  const articleHref = resolved.href;
+  report.doiFound = stageResult(true, "已透過 chndoi.org 解析到境外文章連結（已轉 EZproxy 代理網址）：" + articleHref);
+  rec("已透過 chndoi.org 解析到境外文章連結（已轉 EZproxy 代理網址）：" + articleHref);
+  addThreadLog("Chinese paper search: resolved article href via chndoi.org", { doi, articleHref, rawHref: resolved.rawHref });
 
   // 進文章頁 → 點文章頁下載按鈕 → 攔截觸發的下載
   const dl = await downloadCnkiArticleViaClick(tabId, articleHref, downloadName, folder, workerIdx, trace);
@@ -237,33 +213,41 @@ async function runChineseSearchAndDownload(tabId, item, doi, pmid, workerIdx, tr
   return { pdfUrl: articleHref, downloaded: true, failureReason: "", report };
 }
 
-// 點進文章頁、點文章頁最下面的「下載」按鈕（a.btn-download-logo）觸發真正下載。
-// 比直接點搜尋結果列表的下載連結更穩定：搜尋頁 → 文章頁 → 下載按鈕這條路徑
-// 完全是真實點擊鏈，Referer 完整，不會被 CNKI 的來源檢查擋下（見檔案開頭說明）。
-// 回傳 { ok, reason }。
+// 開文章頁（articleHref 是 chndoi.org 解析出來的「境外」連結，導航過去會自動
+// 跳轉到最終的文章頁）、點文章頁最下面的「下載」按鈕（a.btn-download-logo）
+// 觸發真正下載。回傳 { ok, reason }。
 async function downloadCnkiArticleViaClick(tabId, articleHref, downloadName, folder, workerIdx, trace = null) {
   const rec = line => { if (Array.isArray(trace)) trace.push(traceStamp() + "[中文論文查詢] " + line); };
   const downloadFolder = sanitizeDownloadFolder(folder || "PubMed_PDFs");
   const targetPath = downloadFolder + "/" + (downloadName || ("PMID_" + Date.now())) + ".pdf";
 
-  // 文章頁本身是一般內容頁（不像下載端點會檢查 Referer 來源），實測搜尋結果頁
-  // 本來就是直接組網址導航過去的（見 runChineseSearchAndDownload），並非靠點擊，
-  // 可見 CNKI 不是每個頁面都要求真實點擊鏈。點文章列表連結（target="_blank"）
-  // 開新分頁這段改用 chrome.tabs.create 直接開，比較不會受頁面 JS 綁定時機、
-  // 瀏覽器彈出視窗政策等因素影響而漏開分頁（先前用「模擬點擊 + 等
-  // chrome.tabs.onCreated」偶爾會逾時偵測不到新分頁）。真正需要靠「真實點擊鏈」
-  // 帶對 Referer 的只有最後一步的下載按鈕，那段仍然用真的點擊。
+  // 文章頁本身是一般內容頁（不像下載端點會檢查 Referer 來源），直接組網址
+  // 導航過去即可，不必靠點擊；可見 CNKI 不是每個頁面都要求真實點擊鏈。開新分頁
+  // 這段用 chrome.tabs.create 直接開，比較不會受頁面 JS 綁定時機、瀏覽器彈出
+  // 視窗政策等因素影響而漏開分頁（先前用「模擬點擊 + 等 chrome.tabs.onCreated」
+  // 偶爾會逾時偵測不到新分頁）。真正需要靠「真實點擊鏈」帶對 Referer 的只有
+  // 最後一步的下載按鈕，那段仍然用真的點擊。
+  // 注意：這裡刻意不傳 openerTabId。openerTabId 要求開新分頁的視窗跟
+  // chrome.tabs.create 預設要放的視窗（目前使用中/最後聚焦的視窗）一致，但
+  // worker 分頁池（background.js buildTabPool）都是背景分頁，不保證跟使用者
+  // 當下聚焦的視窗相同，實測傳了 openerTabId 會讓 chrome.tabs.create 直接
+  // reject（"開啟文章頁分頁失敗"）。跟其他地方（background.js 的
+  // buildTabPool/recycleWorkerTab 等）一致，只傳 url/active，不指定
+  // openerTabId/windowId。
   let articleTabId = null;
 
   try {
-    const newTab = await chrome.tabs.create({ url: articleHref, openerTabId: tabId, active: false }).catch(e => {
-      addThreadLog("Chinese paper search: chrome.tabs.create threw", { articleHref, error: e?.message || String(e) });
+    let createError = "";
+    const newTab = await chrome.tabs.create({ url: articleHref, active: false }).catch(e => {
+      createError = e?.message || String(e);
+      addThreadLog("Chinese paper search: chrome.tabs.create threw", { articleHref, error: createError });
       return null;
     });
     if (!newTab) {
-      rec("結果：開啟文章頁分頁失敗");
-      addThreadLog("Chinese paper search: failed to open article tab", { articleHref });
-      return { ok: false, reason: "開啟文章頁分頁失敗（chrome.tabs.create 未成功）。" };
+      const reason = "開啟文章頁分頁失敗（chrome.tabs.create 未成功）。" + (createError ? "錯誤訊息：" + createError : "");
+      rec("結果：" + reason);
+      addThreadLog("Chinese paper search: failed to open article tab", { articleHref, createError });
+      return { ok: false, reason };
     }
     articleTabId = newTab.id;
     rec("已開啟文章頁分頁（tabId=" + articleTabId + "），等待載入完成：" + articleHref);
