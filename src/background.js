@@ -3127,11 +3127,21 @@ async function waitForManualVerification(workerIdx = -1) {
 }
 
 // 檢查分頁目前是否顯示人機驗證頁。true=是、false=不是、null=無法判定（載入中/錯誤頁）
+//
+// 選擇器改成跟 getManualVerificationChallengeSelector()（畫愛心要定位哪個元件用的
+// 那份表）共用同一份，理由：
+//   1. 原本這裡自己維護一份「舊版」選擇器，缺了 iframe[src*='challenges.cloudflare.com']
+//      跟 [id^='cf-chl-widget-']——真正的 Cloudflare Turnstile 挑戰 iframe，src 裡
+//      不會出現字面上的 "turnstile"，iframe[src*='turnstile'] 這條對這類頁面永遠配
+//      不到，導致這裡誤判「沒有驗證頁」，使用者其實正卡在驗證頁前卻沒被暫停詢問。
+//   2. 使用者在進階設定自訂過驗證挑戰元件的話，這裡也該跟著用同一個，而不是自己
+//      另一套邏輯（不然自訂了也只影響畫愛心定位，判斷「有沒有驗證」還是用舊邏輯）。
 async function tabShowsManualVerification(tabId) {
   try {
+    const selector = await getManualVerificationChallengeSelector();
     const r = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => {
+      func: (sel) => {
         // 很多正常頁面掛著「隱形 reCAPTCHA」（如 LWW 每頁都有的 Email to Colleague
         // 功能），DOM 裡有 recaptcha iframe 但根本沒有要使用者驗證。
         // 只認「看得見、且不是角落徽章」的挑戰元件，避免把正常頁面誤判成驗證頁。
@@ -3143,16 +3153,14 @@ async function tabShowsManualVerification(tabId) {
           const rect = el.getBoundingClientRect();
           return rect.width > 40 && rect.height > 40;
         };
-        const challengeEls = Array.from(document.querySelectorAll(
-          "#challenge-form, #cf-challenge-running, .cf-turnstile, .g-recaptcha, #px-captcha, " +
-          "iframe[src*='turnstile'], iframe[src*='recaptcha'], iframe[src*='hcaptcha']"
-        ));
+        const challengeEls = Array.from(document.querySelectorAll(sel));
         return {
           hasChallengeDom: challengeEls.some(isVisibleChallenge),
           title: document.title || "",
           text: (document.body?.innerText || "").slice(0, 4000),
         };
-      }
+      },
+      args: [selector]
     });
     const state = r?.[0]?.result;
     if (!state) return null;
@@ -4205,7 +4213,13 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
   while (Date.now() < deadline) {
     const check = await preflightPdfCheck(pdfUrl, diag);
     if (check === true) { rec("  預熱後預檢：已回傳真 PDF"); return true; }
-    if (diag.manualVerification) {
+    // 背景 fetch() 打這種 Cloudflare/AWS 簽名網址不一定跟真人分頁拿到一樣的回應
+    // （有些挑戰只針對「非導航」的請求另外處理，fetch 可能逾時或回一個沒有關鍵字的
+    // 頁面），單靠 preflightPdfCheck 的文字比對可能漏掉；這裡多補一個訊號：直接看
+    // 分頁本身（已經導航到 warmUrl，很多時候 warmUrl 就是同一個簽名網址）現在是不是
+    // 正顯示著驗證挑戰的 DOM 元件，兩個訊號任一個成立就視為需要人工驗證。
+    const domShowsChallenge = !diag.manualVerification && await tabShowsManualVerification(tabId);
+    if (diag.manualVerification || domShowsChallenge) {
       if (G.manualVerifyPause && !G.stopped) {
         // 暫停整批任務、開前景分頁等使用者手動通過驗證；
         // 本篇先以失敗收場，驗證完成後 worker 迴圈會自動從頭重跑此篇
