@@ -14,7 +14,8 @@
     "notifications",
     "windows",
     "debugger",
-    "nativeMessaging"
+    "nativeMessaging",
+    "power"
   ],
   "host_permissions": [
     "<all_urls>",

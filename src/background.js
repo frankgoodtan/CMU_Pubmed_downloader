@@ -39,6 +39,12 @@ try {
 } catch(e) {
   console.warn("location_target load failed:", e);
 }
+// Discord 下載狀況通知，獨立資料夾方便維護（見 discord/discord_notifier.js 開頭說明）
+try {
+  importScripts("discord/discord_notifier.js");
+} catch(e) {
+  console.warn("discord_notifier load failed:", e);
+}
 
 let controlWindowId = null;
 
@@ -110,19 +116,28 @@ const STALL_THRESHOLD_MS_POLITE = 100000; // 保守模式下卡住視窗拉長�
 const STALL_MAX_TOTAL_WORKERS = 10;     // 同時存在的 worker 總數上限
 const STALL_CHECK_INTERVAL_MS = 5000;   // 多久巡視一次是否有 worker 卡住
 
-// ── MV3 service worker keepalive ──
+// ── MV3 service worker keepalive + 系統睡眠阻擋 ──
 // 長時間純等待（暫停、等使用者輸入帳密、保守模式休息 1-2 分鐘）期間沒有任何
 // chrome API 呼叫，SW 會因 30 秒閒置被 Chrome 終止，記憶體狀態 G 全部消失。
 // 下載期間每 20 秒呼叫一次輕量 API 重置閒置計時器。
+//
+// 同一組 start/stop 順便管 chrome.power：200 篇這種規模跑起來動輒一兩小時，
+// 很容易撞到 Windows 預設的系統睡眠時間，睡眠會把整個分頁/網路連線凍結，
+// 等於下載被硬生生中斷。requestKeepAwake("system") 只擋「系統睡眠」，不擋
+// 「螢幕關閉」——螢幕該多久關掉還是照使用者原本的電源設定走，不需要整台
+// 電腦的螢幕一直亮著。暫停不釋放（暫停期間一樣不希望睡眠打斷），只有真正
+// 停止/完成/重設才 release。
 let keepAliveTimer = null;
 function startKeepAlive() {
   if (keepAliveTimer) return;
   keepAliveTimer = setInterval(() => {
     chrome.runtime.getPlatformInfo(() => {});
   }, 20000);
+  chrome.power.requestKeepAwake("system");
 }
 function stopKeepAlive() {
   if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
+  chrome.power.releaseKeepAwake();
 }
 
 // ── 下載檔名登記表 ──
@@ -174,6 +189,10 @@ function resetState() {
     // 會拖垮畫面所以有 cap；debug log 要的是「這一整批跑下來全部發生過的事」，
     // 只在 finishAll() 寫成檔案那一刻才用完即棄，所以沒有保留上限的理由。
     debugRun: { logs: [], threadLogs: [], failureNotes: [], startedAt: Date.now() },
+    // Discord 通知用：discordBatch 累積到 DISCORD_BATCH_SIZE 篇就送一次進度訊息、
+    // 送完清空；discordAllItems 整個 run 不清空，跑完/中途停止時餵給最終總結訊息。
+    discordBatch:    [],
+    discordAllItems: [],
     resultsMap:    {},
     downloadFolder:"PubMed_PDFs",
     batchSize:     0,
@@ -1203,6 +1222,19 @@ async function runWorker(workerIdx) {
       itemExcelStatus === STATUS_SUCCESS ? "ok" : itemExcelStatus === STATUS_RETRY ? "warn" : "fail"
     );
 
+    // Discord 通知：測試下載不算數。每滿 DISCORD_BATCH_SIZE 篇送一次進度訊息，
+    // discordAllItems 整個 run 都留著，跑完/中途停止時餵給 finishAll() 的總結訊息。
+    if (!G.testMode) {
+      const discordItem = { paperNo: item.paperNo, pmid: item.pmid, title: item.title, status: itemExcelStatus };
+      G.discordBatch.push(discordItem);
+      G.discordAllItems.push(discordItem);
+      if (G.discordBatch.length >= DISCORD_BATCH_SIZE) {
+        const batch = G.discordBatch;
+        G.discordBatch = [];
+        sendDiscordBatchUpdate(batch, G.done, G.total).catch(() => {});
+      }
+    }
+
     chrome.runtime.sendMessage({
       action: "RESULT_UPDATE", item, status: itemExcelStatus,
       resultsMap: G.resultsMap,
@@ -1376,6 +1408,17 @@ function finishAll() {
   addLog("\n全部完成：成功 " + G.ok + "，失敗 " + G.fail + "，未下載 " + G.skip, "ok");
 
   writeDebugLogFile();
+  if (!G.testMode) {
+    sendDiscordFinalReport({
+      doneCount: G.done,
+      totalCount: G.total,
+      ok: G.ok,
+      fail: G.fail,
+      skip: G.skip,
+      stoppedEarly: G.stopped,
+      allItems: G.discordAllItems,
+    }).catch(() => {});
+  }
   triggerExcelWrite({ toDownload: true });
   // 本地資料夾模式：整批跑完後自動核對一次，抓出資料夾實際內容跟 Excel 狀態不一致
   // 的地方（例如某篇途中被中斷、寫檔失敗但沒正確回報）。這裡不是由 popup 發請求

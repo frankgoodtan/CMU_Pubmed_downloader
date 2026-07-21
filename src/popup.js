@@ -52,6 +52,10 @@ const testDownloadBtn      = document.getElementById("testDownloadBtn");
 const testDownloadMatchInfo = document.getElementById("testDownloadMatchInfo");
 // 進階設定面板（人機驗證選項＋出版商 API 憑證）的 UI 邏輯在 api_settings.js（AdvancedSettings）
 const manualVerifyPauseInput = document.getElementById("manualVerifyPauseInput");
+const discordEnabledInput   = document.getElementById("discordEnabledInput");
+const discordWebhookInput   = document.getElementById("discordWebhookInput");
+const discordWebhookSaveBtn = document.getElementById("discordWebhookSaveBtn");
+const discordWebhookStatus  = document.getElementById("discordWebhookStatus");
 const verifySection    = document.getElementById("verifySection");
 const verifyUrlNote    = document.getElementById("verifyUrlNote");
 const verifyQueueNote  = document.getElementById("verifyQueueNote");
@@ -158,6 +162,13 @@ document.querySelector(".stat-box.skip .lbl") && (document.querySelector(".stat-
 // 初始化：同步 background 狀態
 // ══════════════════════════════════
 window.addEventListener("load", () => {
+  // ── 恢復 Discord 通知設定：webhook 網址留空代表沿用 discord_notifier.js
+  //    裡的預設值，不在這裡重複那個網址字串（避免兩邊改一個忘了改另一個）──
+  chrome.storage.local.get(["discordEnabled", "discordWebhookUrl"], data => {
+    if (discordEnabledInput) discordEnabledInput.checked = !!data.discordEnabled;
+    if (discordWebhookInput) discordWebhookInput.value = data.discordWebhookUrl || "";
+  });
+
   // ── 從 storage 恢復上次的完成紀錄 & 資料夾名稱 ──
   chrome.storage.local.get(["completedPmids", "completedCount", "downloadFolder"], data => {
     const pmids = data.completedPmids || [];
@@ -1531,6 +1542,31 @@ localFolderModeInput?.addEventListener("change", () => {
     // （可能剛才在本地資料夾模式下因為已接上專案而被收起）。
     setUploadAreaVisible(true);
   }
+});
+
+discordEnabledInput?.addEventListener("change", () => {
+  chrome.storage.local.set({ discordEnabled: discordEnabledInput.checked });
+});
+
+discordWebhookSaveBtn?.addEventListener("click", () => {
+  const value = (discordWebhookInput?.value || "").trim();
+  if (value && !/^https:\/\/(discord|discordapp)\.com\/api\/webhooks\//.test(value)) {
+    if (discordWebhookStatus) {
+      discordWebhookStatus.textContent = "⚠ 看起來不像 Discord Webhook 網址（應該以 https://discord.com/api/webhooks/ 開頭），沒有儲存。";
+      discordWebhookStatus.style.color = "#dc2626";
+    }
+    return;
+  }
+  // 留空＝清掉 storage 裡的覆寫值，退回 discord_notifier.js 內建的預設 webhook
+  const apply = value
+    ? chrome.storage.local.set({ discordWebhookUrl: value })
+    : chrome.storage.local.remove(["discordWebhookUrl"]);
+  Promise.resolve(apply).then(() => {
+    if (discordWebhookStatus) {
+      discordWebhookStatus.textContent = value ? "✅ 已更新 Webhook 網址，之後都會用這個。" : "✅ 已清空，改用預設 Webhook。";
+      discordWebhookStatus.style.color = "#16a34a";
+    }
+  });
 });
 
 // ══════════════════════════════════
