@@ -29,6 +29,7 @@ const openDownloadSettingsBtn = document.getElementById("openDownloadSettingsBtn
 const batchSizeInput   = document.getElementById("batchSizeInput");
 const politeModeRow    = document.getElementById("politeModeRow");
 const politeModeInput  = document.getElementById("politeModeInput");
+const discordRow       = document.getElementById("discordRow");
 const startFromInput   = document.getElementById("startFromInput");
 const startFromBrowseBtn = document.getElementById("startFromBrowseBtn");
 const endAtRow         = document.getElementById("endAtRow");
@@ -1149,6 +1150,7 @@ function ingestExcelArrayBuffer(arrayBuffer, displayName) {
   if (folderRow) folderRow.style.display = "flex";
   if (batchRow) batchRow.style.display = "flex";
   if (politeModeRow) politeModeRow.style.display = "flex";
+  if (discordRow) discordRow.style.display = "flex";
   AdvancedSettings.show();
   if (startFromRow) startFromRow.style.display = "flex";
   if (endAtRow) endAtRow.style.display = "flex";
@@ -1373,6 +1375,7 @@ function resetLoadedExcelState(showUpload = true) {
   if (folderRow) folderRow.style.display = "none";
   if (batchRow) batchRow.style.display = "none";
   if (politeModeRow) politeModeRow.style.display = "none";
+  if (discordRow) discordRow.style.display = "none";
   if (startFromRow) startFromRow.style.display = "none";
   if (endAtRow) endAtRow.style.display = "none";
   if (stopAfterRow) stopAfterRow.style.display = "none";
@@ -1899,6 +1902,7 @@ clearBtn.addEventListener("click", () => {
   if (folderRow)        folderRow.style.display        = "none";
   if (batchRow)         batchRow.style.display         = "none";
   if (politeModeRow)    politeModeRow.style.display    = "none";
+  if (discordRow)       discordRow.style.display       = "none";
   AdvancedSettings.hide();
   if (verifySection)    verifySection.style.display    = "none";
   if (startFromRow)     startFromRow.style.display     = "none";
