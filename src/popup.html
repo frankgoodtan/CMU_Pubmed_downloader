@@ -484,6 +484,20 @@
     </label>
     <span class="delay-note">建議大量下載時開啟（限最多 2 篇並行、每篇 8-15 秒、每 25 篇休息 1-2 分鐘）</span>
   </div>
+  <!-- 🔔 Discord 下載狀況通知：常駐主介面（不收合），比較容易看到、也預設開啟 -->
+  <div class="settings-row" id="discordRow" style="flex-direction:column; align-items:stretch; gap:4px;">
+    <div style="font-weight:700; font-size:12px; color:#334155;">🔔 Discord 下載狀況通知</div>
+    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
+      <input type="checkbox" id="discordEnabledInput" checked>
+      <span>開啟後，每處理完 10 篇論文＋全部處理完成時（含中途停止），發送訊息到下面的 Discord Webhook</span>
+    </label>
+    <div style="display:flex; gap:6px; align-items:center;">
+      <input type="password" id="discordWebhookInput" class="wide-input" placeholder="Discord Webhook 網址">
+      <button type="button" id="discordWebhookSaveBtn">確定修改</button>
+    </div>
+    <span class="delay-note" id="discordWebhookStatus">留空或不改就沿用預設 Webhook；改過之後以後都用新的網址</span>
+  </div>
+
   <!-- 驗證與 API 進階設定（收合式，不佔主介面） -->
   <div class="settings-row" id="advancedRow">
     <button type="button" id="advancedToggleBtn">⚙ 驗證與 API 進階設定</button>
@@ -515,7 +529,9 @@
       <span class="delay-note">只影響畫愛心要定位哪個元件，不影響「有沒有偵測到人機驗證」本身的判斷</span>
     </div>
 
-    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">📁 本地資料夾模式</div>
+    <hr style="border:none; border-top:1px solid #e2e8f0; margin:14px 0;">
+
+    <div style="font-weight:700; font-size:12px; color:#334155; margin-bottom:6px;">📁 本地資料夾模式</div>
     <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
       <input type="checkbox" id="allowChromeDownloadsFallbackInput">
       <span>本地資料夾模式寫檔失敗時，允許退回 Chrome 原生下載（存進 Chrome 下載資料夾）</span>
@@ -530,7 +546,9 @@
       <span class="delay-note">四顆按鈕（建立全新專案／選取已存在專案／核對進度／更新論文清單）勾過「知道了下次不顯示」的說明，按這裡可以全部恢復顯示</span>
     </div>
 
-    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">☁ Chrome 下載 API 設定（本地資料夾模式關閉時才會用到）</div>
+    <hr style="border:none; border-top:1px solid #e2e8f0; margin:14px 0;">
+
+    <div style="font-weight:700; font-size:12px; color:#334155; margin-bottom:6px;">☁ Chrome 下載 API 設定（本地資料夾模式關閉時才會用到）</div>
     <div class="settings-row" id="folderRow" style="padding:0 0 4px;">
       <label>下載資料夾</label>
       <input type="text" id="downloadFolderInput" class="wide-input" value="" placeholder="例如 PubMed_PDFs/子資料夾">
@@ -538,20 +556,11 @@
       <span class="delay-note">位於 Chrome 預設下載資料夾內</span>
     </div>
 
-    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">🔑 出版商官方 API（有填就優先走 API 下載，不經出版社網頁、不會遇人機驗證）</div>
+    <hr style="border:none; border-top:1px solid #e2e8f0; margin:14px 0;">
+
+    <div style="font-weight:700; font-size:12px; color:#334155; margin-bottom:6px;">🔑 出版商官方 API（有填就優先走 API 下載，不經出版社網頁、不會遇人機驗證）</div>
     <!-- 各出版商憑證欄位由 api_settings.js 依 publisher_apis.js 的註冊表自動產生 -->
     <div id="publisherApiFields"></div>
-
-    <div style="font-weight:700; font-size:12px; color:#334155; margin:12px 0 6px;">🔔 Discord 下載狀況通知</div>
-    <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
-      <input type="checkbox" id="discordEnabledInput">
-      <span>開啟後，每處理完 10 篇論文＋全部處理完成時（含中途停止），發送訊息到下面的 Discord Webhook</span>
-    </label>
-    <div style="margin-top:6px; display:flex; gap:6px; align-items:center;">
-      <input type="password" id="discordWebhookInput" class="wide-input" placeholder="Discord Webhook 網址">
-      <button type="button" id="discordWebhookSaveBtn">確定修改</button>
-    </div>
-    <span class="delay-note" id="discordWebhookStatus">留空或不改就沿用預設 Webhook；改過之後以後都用新的網址</span>
   </div>
   <div class="settings-row" id="startFromRow">
     <label>起始 PMID/title</label>

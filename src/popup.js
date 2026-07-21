@@ -162,11 +162,13 @@ document.querySelector(".stat-box.skip .lbl") && (document.querySelector(".stat-
 // 初始化：同步 background 狀態
 // ══════════════════════════════════
 window.addEventListener("load", () => {
-  // ── 恢復 Discord 通知設定：webhook 網址留空代表沿用 discord_notifier.js
-  //    裡的預設值，不在這裡重複那個網址字串（避免兩邊改一個忘了改另一個）──
-  chrome.storage.local.get(["discordEnabled", "discordWebhookUrl"], data => {
-    if (discordEnabledInput) discordEnabledInput.checked = !!data.discordEnabled;
-    if (discordWebhookInput) discordWebhookInput.value = data.discordWebhookUrl || "";
+  // ── 恢復 Discord 通知設定：跟 background 要「目前實際生效」的設定（不是
+  //    直接讀 storage），這樣就算使用者從沒改過 webhook，欄位也會顯示
+  //    discord_notifier.js 內建的預設網址，而不是一片空白讓人誤以為沒設定 ──
+  chrome.runtime.sendMessage({ action: "GET_DISCORD_CONFIG" }, cfg => {
+    if (!cfg) return;
+    if (discordEnabledInput) discordEnabledInput.checked = !!cfg.enabled;
+    if (discordWebhookInput) discordWebhookInput.value = cfg.webhookUrl || "";
   });
 
   // ── 從 storage 恢復上次的完成紀錄 & 資料夾名稱 ──

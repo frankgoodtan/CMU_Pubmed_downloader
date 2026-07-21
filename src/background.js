@@ -256,6 +256,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ resultsMap: G.resultsMap, resultsFailMap: G.resultsFailMap || {} });
       return true;
 
+    // popup 要顯示「目前實際生效的 Discord 設定」用（包含沒被使用者改過、
+    // 退回 discord_notifier.js 內建預設值的 webhook 網址）；不讓 popup 直接
+    // 讀 storage，避免預設 webhook 字串要在兩個檔案各存一份、之後改一個忘了改另一個。
+    case "GET_DISCORD_CONFIG":
+      getDiscordConfig().then(cfg => sendResponse(cfg));
+      return true;
+
     case "SAVE_SOURCE_EXCEL":
       chrome.storage.local.set({
         sourceExcelB64: msg.b64,

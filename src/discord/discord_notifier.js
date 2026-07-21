@@ -37,11 +37,13 @@ const DISCORD_STATUS_EMOJI = {
   "下次重試": "🔁",
 };
 
+// 預設開啟：只有使用者明確關過（storage 存成 false）才維持關閉，
+// 跟 localFolderModeEnabled 的「預設開啟」邏輯一致。
 function getDiscordConfig() {
   return new Promise(resolve => {
     chrome.storage.local.get(["discordEnabled", "discordWebhookUrl"], d => {
       resolve({
-        enabled: !!d.discordEnabled,
+        enabled: d.discordEnabled !== false,
         webhookUrl: d.discordWebhookUrl || DISCORD_DEFAULT_WEBHOOK_URL,
       });
     });
