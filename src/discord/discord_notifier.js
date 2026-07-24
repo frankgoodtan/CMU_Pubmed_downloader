@@ -50,21 +50,54 @@ function getDiscordConfig() {
   });
 }
 
+// 原本失敗（網路瞬斷、Discord 429/5xx）只記一筆 threadLog 就結束，訊息永久遺失、
+// 使用者在正常 UI 上完全看不到任何提示——「有時候收不到」很大機率就是這種單次
+// fetch 失敗從沒重試造成的，不是 webhook 設定本身有問題。改成最多重試
+// DISCORD_MAX_RETRIES 次；429 時照 Discord 回的 retry_after 秒數等待再送，其他
+// 失敗用固定的短延遲。重試全部用盡才真的放棄，這時額外呼叫 addLog（不是只有
+// addThreadLog）讓使用者在主畫面就看得到，不用另外去翻 debug log 才知道發生過。
+const DISCORD_MAX_RETRIES = 2;
+const DISCORD_RETRY_DELAY_MS = 2000;
+
 async function discordWebhookPost(webhookUrl, content) {
-  try {
-    const res = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-    });
-    if (!res.ok) {
+  let lastError = "";
+  for (let attempt = 0; attempt <= DISCORD_MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      if (res.ok) return true;
+
       const bodyText = await res.text().catch(() => "");
-      addThreadLog("Discord webhook 回應非 2xx", { status: res.status, body: bodyText.slice(0, 300) });
+      lastError = `HTTP ${res.status}: ${bodyText.slice(0, 300)}`;
+      addThreadLog("Discord webhook 回應非 2xx", { status: res.status, body: bodyText.slice(0, 300), attempt: attempt + 1 });
+
+      if (attempt >= DISCORD_MAX_RETRIES) break;
+      if (res.status === 429) {
+        // Discord rate limit：回應體帶 retry_after（秒），照它等待，沒帶到就退回固定延遲。
+        let retryAfterMs = DISCORD_RETRY_DELAY_MS;
+        try {
+          const parsed = JSON.parse(bodyText);
+          if (typeof parsed.retry_after === "number") retryAfterMs = Math.ceil(parsed.retry_after * 1000) + 200;
+        } catch {}
+        await sleep(retryAfterMs);
+      } else if (res.status >= 500 || res.status === 0) {
+        await sleep(DISCORD_RETRY_DELAY_MS);
+      } else {
+        // 4xx（除了 429）多半是 webhook 網址本身失效/權限問題，重試也不會變好，直接放棄。
+        break;
+      }
+    } catch (e) {
+      lastError = e?.message || String(e);
+      addThreadLog("Discord webhook 發送失敗", { error: lastError, attempt: attempt + 1 });
+      if (attempt >= DISCORD_MAX_RETRIES) break;
+      await sleep(DISCORD_RETRY_DELAY_MS);
     }
-  } catch (e) {
-    // Discord 發不出去不該讓下載流程掛掉，只記一筆 threadLog 靜默略過
-    addThreadLog("Discord webhook 發送失敗", { error: e?.message || String(e) });
   }
+  addLog("⚠ Discord 通知發送失敗（已重試 " + DISCORD_MAX_RETRIES + " 次仍未成功）：" + lastError, "warn");
+  return false;
 }
 
 // 把一大段文字依 maxLen 切成多塊，優先在空白處斷開（避免把「0205✅」這種

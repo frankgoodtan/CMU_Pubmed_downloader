@@ -2149,6 +2149,12 @@ async function getPdfUrlWithFallback(tabId, item, workerIdx, trace = null, downl
       action: "BOT_DETECTED", pmid: item.pmid,
       detail: "Bot/captcha/access challenge detected"
     }).catch(() => {});
+    // 跟出版商頁面遇到人機驗證同一套處理：暫停全體派發、開分頁提醒使用者手動完成驗證
+    // （沿用同一個 worker 常駐分頁，preserveTab=true 不能被關掉）。原本這裡偵測到 bot
+    // 就直接判失敗、完全沒接進驗證暫停/提醒流程，使用者連「這是驗證頁」都不會被告知。
+    // 本篇這次仍以 pdfUrl:"BOT" 判定失敗即可，外層 runWorker 看到 G.verifyPending 會
+    // 自動把這篇重新排隊（shouldRestartAfterVerify，最多重試 2 次），不需要在這裡自己等待。
+    await requestManualVerificationPause(pubmedUrl, "PubMed 頁面人機驗證", tabId, false, true);
     return { pdfUrl: "BOT", failureReason: "", fullTextLinks: [], linkAttempts, report };
   }
 
@@ -2802,15 +2808,31 @@ async function checkPageState(tabId) {
     const url = t.url || "";
     if (url.includes("/user/login")) return "login";
 
+    // 選擇器改用跟 tabShowsManualVerification/畫愛心共用的那份（getManualVerificationChallengeSelector），
+    // 不再自己維護一份獨立、容易忘記同步更新的清單——原本這裡缺了
+    // [id^='cf-chl-widget-'] 跟 iframe[src*='challenges.cloudflare.com']，對真正的
+    // Cloudflare Turnstile 挑戰（iframe src 不會出現字面上的 "turnstile"）永遠比對不到。
+    const selector = await getManualVerificationChallengeSelector();
     const r = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => {
+      func: (sel) => {
+        // 跟 tabShowsManualVerification 同一套 shadow-root 穿透邏輯：挑戰元件常包在
+        // open shadow root 裡，只查 document 這一層會漏掉。
+        const deepQuerySelectorAll = (root, selector) => {
+          const found = new Set(Array.from(root.querySelectorAll(selector)));
+          const all = root.querySelectorAll("*");
+          for (const el of all) {
+            if (el.shadowRoot) {
+              for (const nested of deepQuerySelectorAll(el.shadowRoot, selector)) {
+                found.add(nested);
+              }
+            }
+          }
+          return Array.from(found);
+        };
         // 只認明確的驗證頁特徵。單一字詞（robot / captcha / 403）會誤判論文內文，
         // 例如 robotic surgery 相關論文的摘要就含有 "robot"
-        if (document.querySelector(
-          "#challenge-form, #cf-challenge-running, .g-recaptcha, #px-captcha, " +
-          "iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[src*='turnstile']"
-        )) return "bot";
+        if (deepQuerySelectorAll(document, sel).length) return "bot";
 
         const title = (document.title || "").toLowerCase();
         if (title.includes("just a moment") ||
@@ -2833,7 +2855,8 @@ async function checkPageState(tabId) {
         ];
         if (phrases.some(p => text.includes(p))) return "bot";
         return "ok";
-      }
+      },
+      args: [selector]
     });
     return r?.[0]?.result || "ok";
   } catch { return "ok"; }
@@ -3153,7 +3176,25 @@ async function tabShowsManualVerification(tabId) {
           const rect = el.getBoundingClientRect();
           return rect.width > 40 && rect.height > 40;
         };
-        const challengeEls = Array.from(document.querySelectorAll(sel));
+        // 跟 location_target.js 的 deepQuerySelectorAll 同一套邏輯：Cloudflare Turnstile
+        // 等挑戰元件常把實際渲染出的 iframe/容器包在（open）shadow root 裡再插進 DOM，
+        // 只查 document 這一層會直接漏掉，導致明明卡在驗證頁卻判定「沒有驗證」——
+        // 這支函式的結果會決定要不要觸發整套人工驗證暫停+提醒流程，漏判比
+        // locateAllTargetElements 那邊漏判更嚴重（那邊只影響定位精準度，這裡漏判
+        // 會讓使用者完全不知道卡在驗證頁）。
+        const deepQuerySelectorAll = (root, selector) => {
+          const found = new Set(Array.from(root.querySelectorAll(selector)));
+          const all = root.querySelectorAll("*");
+          for (const el of all) {
+            if (el.shadowRoot) {
+              for (const nested of deepQuerySelectorAll(el.shadowRoot, selector)) {
+                found.add(nested);
+              }
+            }
+          }
+          return Array.from(found);
+        };
+        const challengeEls = deepQuerySelectorAll(document, sel);
         return {
           hasChallengeDom: challengeEls.some(isVisibleChallenge),
           title: document.title || "",
@@ -3168,6 +3209,32 @@ async function tabShowsManualVerification(tabId) {
     return isManualVerificationText(state.title + " " + state.text);
   } catch {
     return null;
+  }
+}
+
+// 診斷用：把目前分頁的 outerHTML（截斷）連同標題/網址寫進 threadLog，跑完這次批次會
+// 一起寫進 native_host/debug_log/ 的 debug log 檔。專門給「疑似卡在驗證頁，但
+// tabShowsManualVerification／locateAllTargetElements 都抓不到任何已知元件」這種
+// 目前還沒見過 HTML 長相、選擇器/文字關鍵字都需要更新才能涵蓋的情況用——沒有實際
+// HTML 沒辦法對症下藥調整選擇器，這裡先把證據留下來，下次發生時直接從 debug log
+// 撈出來看，不用使用者自己再手動存一次。只在同一輪驗證流程的第一次嘗試呼叫，
+// 避免同一篇卡住時每次重試都存一份洗版。
+async function captureVerificationPageSnapshot(tabId, label) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        url: location.href,
+        title: document.title || "",
+        html: (document.documentElement?.outerHTML || "").slice(0, 20000),
+      }),
+    });
+    const snap = injection?.result;
+    if (snap) {
+      addThreadLog("Verification page snapshot (no known challenge element/text matched)", { label, ...snap });
+    }
+  } catch (e) {
+    addThreadLog("Verification page snapshot capture failed", { label, error: e.message });
   }
 }
 
@@ -3359,6 +3426,25 @@ function triggerVerificationHeart(contextLabel, tabId, presetPoint = null, thres
       addLog("未捕捉到目標元素", "warn");
     }
 
+    // 一個候選元件都抓不到時，退而附上「目前分頁所在瀏覽器視窗」的螢幕範圍
+    // （windowRegion），讓 native host 把盲搜範圍收斂到這裡，而不是完全放棄，
+    // 或搜整個虛擬桌面（誤判率高很多）。有 point 時不需要，dom_region 已經夠精準。
+    let windowRegion = null;
+    if (!point && tabId != null) {
+      try {
+        windowRegion = await getViewportScreenBounds(tabId);
+        if (windowRegion) {
+          addLog(
+            `　已改用瀏覽器視窗範圍盲搜（left=${windowRegion.left.toFixed(0)}, top=${windowRegion.top.toFixed(0)}, ` +
+            `width=${windowRegion.width.toFixed(0)}, height=${windowRegion.height.toFixed(0)}）`,
+            "info"
+          );
+        }
+      } catch (e) {
+        addThreadLog("Get viewport screen bounds failed", { error: e.message });
+      }
+    }
+
     return new Promise((resolve) => {
       try {
         chrome.runtime.sendNativeMessage(
@@ -3372,6 +3458,7 @@ function triggerVerificationHeart(contextLabel, tabId, presetPoint = null, thres
               left: point.left, top: point.top, width: point.width, height: point.height,
               matchedSelector: point.matched
             } : {}),
+            ...(windowRegion ? { windowRegion } : {}),
             ...(thresholdOverrides || {}),
             ...(clearDebugFolder ? { clearDebugFolder: true } : {})
           },
@@ -3386,7 +3473,8 @@ function triggerVerificationHeart(contextLabel, tabId, presetPoint = null, thres
               const patternNote = response.moved && response.pattern ? `（軌跡：${response.pattern}）` : "";
               addLog((response.moved ? "已成功移動至該座標，畫愛心" : "未移動至該座標，畫愛心") + patternNote, response.moved ? "ok" : "warn");
               addLog(
-                `　iframe：${response.iframeFound ? "✅ 已知範圍" : "❌ 未知"}　checkbox：${response.checkboxFound ? "✅ 已比對到" : "❌ 沒比對到"}`,
+                `　iframe：${response.iframeFound ? "✅ 已知範圍" : "❌ 未知"}　checkbox：${response.checkboxFound ? "✅ 已比對到" : "❌ 沒比對到"}` +
+                (response.windowRegionUsed ? "　（來自視窗範圍盲搜）" : ""),
                 response.checkboxFound ? "ok" : "warn"
               );
             }
@@ -3576,6 +3664,17 @@ async function monitorManualVerification(tabId, contextLabel = "") {
     );
 
     if (candidates.length === 0) {
+      // 這裡走到，代表 tabShowsManualVerification 判定「有驗證」（DOM 選到已知元件，
+      // 或文字關鍵字命中），但 locateAllTargetElements 用同一份選擇器卻一個候選都
+      // 沒抓到（例如只是文字命中、DOM 完全沒有符合的元件；或元件當下還是 0x0 還沒撐開）。
+      // native host 接下來只能盲找整個螢幕，提醒視窗大機率是空的。只在第一次嘗試時
+      // 存一次頁面快照，方便之後對照到底是什麼樣的挑戰頁讓已知選擇器完全比對不到。
+      if (attempt === 0) {
+        await captureVerificationPageSnapshot(
+          tabId,
+          "monitorManualVerification：判定為驗證頁但 locateAllTargetElements 抓不到任何候選（" + contextLabel + "）"
+        );
+      }
       await triggerVerificationHeart(contextLabel, tabId, null, thresholds, isFirstCandidateCall);
       isFirstCandidateCall = false;
     } else {
@@ -4210,7 +4309,10 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
   // POW（difficulty 4）通常數秒可解，慢站的 challenge 可能更久；輪詢至多 45 秒
   const deadline = Date.now() + 45000;
   const diag = {};
+  let warmupPollCount = 0;
+  let warmupSnapshotTaken = false;
   while (Date.now() < deadline) {
+    warmupPollCount++;
     const check = await preflightPdfCheck(pdfUrl, diag);
     if (check === true) { rec("  預熱後預檢：已回傳真 PDF"); return true; }
     // 背景 fetch() 打這種 Cloudflare/AWS 簽名網址不一定跟真人分頁拿到一樣的回應
@@ -4238,9 +4340,25 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
       addThreadLog("Manual verification required; keeping item retryable", { pdfUrl });
       return false;
     }
+    // 兩個訊號都沒偵測到、頁面也還不是真 PDF：撐過前幾次輪詢（給 DOM 足夠時間渲染）
+    // 仍然這樣，很可能卡在目前選擇器/關鍵字都認不出來的挑戰頁變體（例如 Cloudflare
+    // Turnstile 用了客製網域，iframe src 不含 challenges.cloudflare.com/turnstile 字樣，
+    // 兩個偵測訊號都會落空，使用者只會看到逾時失敗，完全不知道其實卡在驗證頁）。
+    // 沒有實際 HTML 沒辦法對症下藥調整偵測規則，這裡把頁面存證一次，之後從 debug log
+    // 撈出來看；同一輪只存一次，避免每次輪詢都存一份洗版。
+    if (!warmupSnapshotTaken && warmupPollCount === 3) {
+      warmupSnapshotTaken = true;
+      await captureVerificationPageSnapshot(
+        tabId,
+        "warmUpAntiBotChallenge：連續 " + warmupPollCount + " 次輪詢都沒有比對到已知驗證訊號（" + pdfUrl + "）"
+      );
+    }
     await sleep(1500);
   }
   rec("  預熱逾時；最後一次預檢：" + formatPreflightDiag(diag));
+  if (warmupSnapshotTaken) {
+    rec("  ⚠ 逾時前曾偵測到「非 PDF 但也無法辨識為已知驗證頁」的狀態，已將頁面快照存進 debug log，供之後調整偵測規則使用。");
+  }
   return false;
 }
 

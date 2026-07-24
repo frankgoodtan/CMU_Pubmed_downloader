@@ -42,6 +42,7 @@ Chrome Native Messaging 的 stdio 協定：訊息前面帶 4 bytes little-endian
 後面接 UTF-8 JSON。background.js 傳來的 payload 如果帶 left/top/width/height，
 只當作「去哪裡找 checkbox」的範圍提示，實際座標還是自己比對樣板決定，不是
 直接照抄 payload 裡的值。
+此程式只是用來提醒人機驗證，並不包含自動底點擊功能
 """
 
 import ctypes
@@ -339,13 +340,16 @@ def match_checkbox_in_region(screen_bgr, center_x, center_y, half_extent):
     )
 
 
-def padded_region_bounds(region, padding_ratio=DOM_REGION_PADDING_RATIO):
+def padded_region_bounds(region, padding_ratio=DOM_REGION_PADDING_RATIO,
+                          pad_min=DOM_REGION_PAD_MIN, pad_max=DOM_REGION_PAD_MAX):
     """region：dict，帶 left/top/width/height。回傳 (x0, y0, x1, y1)——外加一點
     容錯邊界的範圍，格式不對或寬高不合理就回傳 None。容錯邊界夾在
-    [DOM_REGION_PAD_MIN, DOM_REGION_PAD_MAX] 之間，不會因為 iframe 較大就放大
-    到跑出 iframe 外面。locate_target() 對同一個候選的所有子步驟（checkbox
-    直接比對、logo 備援、備援後的局部搜尋）都共用同一組 bounds，確保「這個候選
-    的範圍」認定完全一致，不會有子步驟各自算出不同、互相打架的範圍。"""
+    [pad_min, pad_max] 之間，不會因為區域較大就放大到跑出區域外面。
+    locate_target() 對同一個候選的所有子步驟（checkbox 直接比對、logo 備援、
+    備援後的局部搜尋）都共用同一組 bounds，確保「這個候選的範圍」認定完全
+    一致，不會有子步驟各自算出不同、互相打架的範圍。pad_min/pad_max 預設是
+    dom_region 那組（單一候選元件的外框，容錯邊界要小）；window_region（整個
+    瀏覽器視窗內容區）呼叫端會傳 0——範圍本來就夠大，不需要再放寬。"""
     try:
         left = float(region["left"])
         top = float(region["top"])
@@ -357,8 +361,8 @@ def padded_region_bounds(region, padding_ratio=DOM_REGION_PADDING_RATIO):
     if width <= 0 or height <= 0:
         return None
 
-    pad_x = clamp(width * padding_ratio, DOM_REGION_PAD_MIN, DOM_REGION_PAD_MAX)
-    pad_y = clamp(height * padding_ratio, DOM_REGION_PAD_MIN, DOM_REGION_PAD_MAX)
+    pad_x = clamp(width * padding_ratio, pad_min, pad_max)
+    pad_y = clamp(height * padding_ratio, pad_min, pad_max)
     return left - pad_x, top - pad_y, left + width + pad_x, top + height + pad_y
 
 
@@ -426,13 +430,80 @@ def _finalize_match(virtual_monitor, match, source, region=None):
     }
 
 
-# 全螢幕盲搜（沒有 dom_region 候選時的 B 模式：logo 全螢幕 + common_checkbox
-# 全螢幕最後手段）目前準度不夠、常常誤判，先關閉。函式本身留著沒刪，之後如果
-# 要重新啟用/改善準度，把這個開關打開、把 locate_target() 裡對應的分支恢復即可。
+# 全螢幕盲搜（logo 全螢幕 + common_checkbox 全螢幕最後手段，範圍是整個虛擬桌面
+# ——含其他螢幕/桌面圖示/工作列）目前準度不夠、常常誤判，先關閉。函式本身留著
+# 沒刪，之後如果要重新啟用/改善準度，把這個開關打開即可。注意這跟下面的
+# window_region 是兩件事：window_region 範圍只有目前分頁所在的瀏覽器視窗內容
+# 區，遠比整個虛擬桌面小、乾淨很多，預設是開著的，不受這個開關影響。
 ENABLE_BLIND_FULLSCREEN_SEARCH = False
 
+# 第 0.5 層：background.js 完全沒抓到任何驗證候選元件時（locateAllTargetElements
+# 回傳空陣列），至少還拿得到「目前分頁所在瀏覽器視窗」的螢幕絕對範圍
+# （chrome.windows.get，見 background.js triggerVerificationHeart /
+# location_target.js getViewportScreenBounds）。範圍比 dom_region（單一候選
+# 元件的外框）大很多，比對到的假陽性風險也高很多，門檻拉高很多、不加容錯
+# 邊界（範圍本來就夠大）。但範圍還是遠比整個虛擬桌面小、乾淨很多——桌面圖示、
+# 工作列、其他視窗、其他螢幕全部排除在外，只留瀏覽器分頁本身的內容範圍，
+# 所以預設就開著，不像 ENABLE_BLIND_FULLSCREEN_SEARCH 那樣先關掉。
+WINDOW_REGION_MIN_SCORE = 0.55
+WINDOW_REGION_LOGO_MIN_SCORE = 0.75
 
-def locate_target(dom_region=None, dom_region_min_score=DOM_REGION_MIN_SCORE, logo_min_score=LOGO_MIN_SCORE):
+
+def _locate_checkbox_in_region(screen_bgr, virtual_monitor, region, region_min_score, logo_min_score,
+                                padding_ratio, pad_min, pad_max, source_label):
+    """dom_region／window_region 共用的核心比對邏輯：先在 region（外加容錯邊界，
+    window_region 呼叫端會傳 0）裡直接比對 common_checkbox 樣板，沒中就退而找
+    logo 當備援、鎖定附近小範圍再比一次（跟 region 的 bounds 取交集，不會跑出
+    這個範圍去比對到畫面上其他東西）。回傳 _finalize_match() 格式的 dict（附
+    checkbox_found）；bounds 算不出來，或兩層都沒中，x/y 會是 None，但 region
+    本身還是會帶出去，讓畫面上至少能標出這個範圍，不是完全空白。"""
+    local_region = {
+        "left": region.get("left", 0) - virtual_monitor["left"],
+        "top": region.get("top", 0) - virtual_monitor["top"],
+        "width": region.get("width"),
+        "height": region.get("height"),
+    }
+    bounds = padded_region_bounds(local_region, padding_ratio=padding_ratio, pad_min=pad_min, pad_max=pad_max)
+    if bounds is None:
+        return {
+            "x": None, "y": None, "score": None, "source": None,
+            "box_left": None, "box_top": None, "box_width": None, "box_height": None,
+            "region": region, "checkbox_found": False,
+        }
+
+    direct_match = match_checkbox_in_bounds(screen_bgr, *bounds)
+    if direct_match is not None and direct_match["score"] >= region_min_score:
+        result = _finalize_match(virtual_monitor, direct_match, source_label, region=region)
+        result["checkbox_found"] = True
+        return result
+
+    logo_in_region = locate_via_vendor_logo_in_bounds(screen_bgr, bounds, min_score=logo_min_score)
+    if logo_in_region is not None:
+        predicted_x, predicted_y, logo_score, vendor_name, scale = logo_in_region
+        half_extent = CHECKBOX_SEARCH_HALF_EXTENT * scale
+        # 跟這個範圍的 bounds 取交集，不讓局部搜尋窗跑出範圍外面。
+        search_x0 = max(bounds[0], predicted_x - half_extent)
+        search_y0 = max(bounds[1], predicted_y - half_extent)
+        search_x1 = min(bounds[2], predicted_x + half_extent)
+        search_y1 = min(bounds[3], predicted_y + half_extent)
+        region_match = match_checkbox_in_bounds(screen_bgr, search_x0, search_y0, search_x1, search_y1)
+        if region_match is not None:
+            result = _finalize_match(virtual_monitor, region_match, vendor_name, region=region)
+            result["checkbox_found"] = True
+            return result
+
+    # 這個範圍內真的找不到 checkbox：範圍本身還是有效（region 不是 None），只是
+    # 裡面沒有比對到——回報範圍讓畫面上至少能標出藍色範圍，checkbox_found 標
+    # False，不去搶別的候選/範圍的地盤。
+    return {
+        "x": None, "y": None, "score": None, "source": None,
+        "box_left": None, "box_top": None, "box_width": None, "box_height": None,
+        "region": region, "checkbox_found": False,
+    }
+
+
+def locate_target(dom_region=None, dom_region_min_score=DOM_REGION_MIN_SCORE, logo_min_score=LOGO_MIN_SCORE,
+                   window_region=None):
     """回傳 dict（見 _finalize_match）；完全找不到目標回傳 None。
     dom_region：background.js 用 DOM 量出來的「這一個候選元件」的外框（dict，帶
     left/top/width/height，螢幕絕對座標）。background.js 一次驗證可能會抓到
@@ -442,69 +513,43 @@ def locate_target(dom_region=None, dom_region_min_score=DOM_REGION_MIN_SCORE, lo
     dom_region_min_score / logo_min_score：第 0／第 1 層各自的採信門檻，預設
     是模組層級常數；background.js 的三次嘗試協定會逐次調低這兩個值傳進來
     （同一頁重試多次仍找不到，很可能是原本門檻卡掉了實際上還過得去的候選）。
+    window_region：background.js 完全沒抓到任何候選元件時退而求其次附上的
+    「瀏覽器視窗本身」螢幕範圍，見 WINDOW_REGION_MIN_SCORE 上面的說明。
 
     有給 dom_region（background.js 已經指定這次要看哪個候選）：全程只在這個
-    候選的範圍（bounds，含一點容錯邊界）內找，不查其他地方——
-      0) 先在 bounds 裡面比對 common_checkbox 樣板。
-      1) 沒中就退而在同一個 bounds 裡找 logo 當備援，找到後鎖定附近小範圍比對
-         checkbox 精確座標——這個小範圍會跟 bounds 取交集，不會跑出這個候選
-         的範圍去（例如跑到隔壁候選、或 iframe 外面的東西）。
-    兩層都沒中，就回報這個候選真的沒找到（可能是佔位元件、或已經驗證通過），
-    回傳 None——絕對不能因為這個候選找不到，就跑去比對到畫面上其他候選的東西
-    （例如把這個候選的提醒，錯誤地指到另一個候選的 checkbox 上，看起來像是
-    「後面幾次位置不準」）。
+    候選的範圍（bounds，含一點容錯邊界）內找，兩層（checkbox 直接比對／logo
+    備援後局部比對）都沒中，就回報這個候選真的沒找到（可能是佔位元件、或已經
+    驗證通過），絕對不會跑去比對到畫面上其他候選的東西。
 
-    沒有 dom_region（background.js 完全沒抓到候選元件，只能盲找）：目前直接
-    回傳 None，不做全螢幕搜尋（見 ENABLE_BLIND_FULLSCREEN_SEARCH）。
+    沒有 dom_region、但有 window_region：退而在整個瀏覽器視窗範圍內用同一套
+    兩層比對（門檻拉高很多），找不到也把 window_region 本身回報回去，讓畫面
+    上至少能標出視窗範圍，而不是完全空白。
+
+    兩者都沒有：只有 ENABLE_BLIND_FULLSCREEN_SEARCH 開著時才對整個虛擬桌面
+    盲搜，預設關閉、直接回傳 None。
     """
     screen_bgr, virtual_monitor = capture_virtual_desktop()
 
     if dom_region is not None:
-        local_region = {
-            "left": dom_region.get("left", 0) - virtual_monitor["left"],
-            "top": dom_region.get("top", 0) - virtual_monitor["top"],
-            "width": dom_region.get("width"),
-            "height": dom_region.get("height"),
-        }
-        bounds = padded_region_bounds(local_region)
-        if bounds is None:
-            # 連 bounds 都算不出來（格式不對／寬高不合理）：至少還是把 iframe
-            # 範圍本身報回去，讓畫面上能標出藍色範圍，即使 checkbox 沒找到。
-            return {
-                "x": None, "y": None, "score": None, "source": None,
-                "box_left": None, "box_top": None, "box_width": None, "box_height": None,
-                "region": dom_region, "checkbox_found": False,
-            }
+        return _locate_checkbox_in_region(
+            screen_bgr, virtual_monitor, dom_region,
+            region_min_score=dom_region_min_score, logo_min_score=logo_min_score,
+            padding_ratio=DOM_REGION_PADDING_RATIO, pad_min=DOM_REGION_PAD_MIN, pad_max=DOM_REGION_PAD_MAX,
+            source_label="dom_region",
+        )
 
-        dom_match = match_checkbox_in_bounds(screen_bgr, *bounds)
-        if dom_match is not None and dom_match["score"] >= dom_region_min_score:
-            result = _finalize_match(virtual_monitor, dom_match, "dom_region", region=dom_region)
-            result["checkbox_found"] = True
+    if window_region is not None:
+        result = _locate_checkbox_in_region(
+            screen_bgr, virtual_monitor, window_region,
+            region_min_score=WINDOW_REGION_MIN_SCORE, logo_min_score=WINDOW_REGION_LOGO_MIN_SCORE,
+            padding_ratio=0.0, pad_min=0.0, pad_max=0.0,
+            source_label="window_region",
+        )
+        if result.get("x") is not None or not ENABLE_BLIND_FULLSCREEN_SEARCH:
             return result
-
-        logo_in_region = locate_via_vendor_logo_in_bounds(screen_bgr, bounds, min_score=logo_min_score)
-        if logo_in_region is not None:
-            predicted_x, predicted_y, logo_score, vendor_name, scale = logo_in_region
-            half_extent = CHECKBOX_SEARCH_HALF_EXTENT * scale
-            # 跟這個候選的 bounds 取交集，不讓局部搜尋窗跑出候選範圍外面。
-            search_x0 = max(bounds[0], predicted_x - half_extent)
-            search_y0 = max(bounds[1], predicted_y - half_extent)
-            search_x1 = min(bounds[2], predicted_x + half_extent)
-            search_y1 = min(bounds[3], predicted_y + half_extent)
-            region_match = match_checkbox_in_bounds(screen_bgr, search_x0, search_y0, search_x1, search_y1)
-            if region_match is not None:
-                result = _finalize_match(virtual_monitor, region_match, vendor_name, region=dom_region)
-                result["checkbox_found"] = True
-                return result
-
-        # 這個候選範圍內真的找不到 checkbox：iframe 本身還是有找到（dom_region
-        # 不是 None），只是裡面沒有比對到 checkbox——回報 iframe 範圍讓畫面上
-        # 至少能標出藍色範圍，checkbox_found 標 False，不去搶別的候選的地盤。
-        return {
-            "x": None, "y": None, "score": None, "source": None,
-            "box_left": None, "box_top": None, "box_width": None, "box_height": None,
-            "region": dom_region, "checkbox_found": False,
-        }
+        # 找不到，但 ENABLE_BLIND_FULLSCREEN_SEARCH 開著：繼續往下試整個虛擬
+        # 桌面盲搜，不要在這裡就放棄（window_region 沒中不代表全螢幕也沒中，
+        # 只是可能真的落在視窗範圍算錯的邊緣）。
 
     if not ENABLE_BLIND_FULLSCREEN_SEARCH:
         return None
@@ -540,12 +585,18 @@ def locate_target_with_retry(
     logo_min_score=LOGO_MIN_SCORE,
     total_wait=LOCATE_RETRY_TOTAL_WAIT,
     interval=LOCATE_RETRY_INTERVAL,
+    window_region=None,
 ):
     deadline = time.time() + total_wait
     result = None
     while True:
         try:
-            result = locate_target(dom_region, dom_region_min_score=dom_region_min_score, logo_min_score=logo_min_score)
+            result = locate_target(
+                dom_region,
+                dom_region_min_score=dom_region_min_score,
+                logo_min_score=logo_min_score,
+                window_region=window_region,
+            )
         except Exception:
             result = None
         # dom_region 模式下 locate_target() 現在永遠回傳 dict（checkbox 沒找到
@@ -750,11 +801,41 @@ def replay_user_trace_template(target_x, target_y, duration=1.0):
     normal_x = -dir_y
     normal_y = dir_x
 
-    template = random.choice(templates)
+    # 挑樣板不再是純隨機——優先挑「原始錄製距離」跟這次實際要移動的距離相近的
+    # 幾筆，再從裡面隨機選一筆（保留一點隨機性，不要每次都選到同一筆，但避免
+    # 選到距離差太懸殊的樣板）。原本純隨機選，選到的樣板距離常常跟實際距離差
+    # 5-10 倍：v（垂直方向的手部自然抖動）是錄製當下用「原始距離的比例」存的，
+    # 套用時是拿現在的實際距離去乘回絕對座標——距離差太多時，這個比例被硬套在
+    # 差很多的實際距離上，短距離會把原本長距離移動的抖動比例壓縮出一堆密集、
+    # 不成比例的鋸齒（看起來又慢又抖），長距離則會把短距離移動的抖動比例放大到
+    # 誇張的擺動幅度。挑距離相近的樣板從根本上減少需要縮放的幅度，比單純調整
+    # distance_ratio 的 clamp 範圍更治本。
+    templates_by_closeness = sorted(templates, key=lambda tpl: abs(tpl["distance"] - distance))
+    pool_size = max(1, len(templates_by_closeness) // 3)
+    template = random.choice(templates_by_closeness[:pool_size])
+
+    # 就算挑了最接近的一批，範圍還是可能差太多（例如收集到的錄製全部都是
+    # 300px 以上的長距離移動，這次卻只要移動 20px）：這種極端情況強行套用
+    # 學來的軌跡意義不大，直接回傳 None，讓呼叫端退回 smooth_move_mouse_to()
+    # 自己的合成貝茲曲線——那條路徑的抖動量是固定的小像素數，不會隨距離縮放，
+    # 短距離移動反而更平滑自然。
+    closest_ratio = distance / max(1, template["distance"])
+    if closest_ratio < 0.3 or closest_ratio > 3.5:
+        return None
+
     speed_ratio = clamp(duration / 1.0, 0.30, 1.60)
-    distance_ratio = clamp(distance / max(1, template["distance"]), 0.60, 1.45)
+    # 距離比例改用開根號縮放，範圍也拉寬很多。原本 clamp(距離比例, 0.60, 1.45)
+    # 等於「不管實際距離多遠，總耗時都跟錄製當下差不多」——但滑鼠起始位置千變
+    # 萬化（可能離目標很近，也可能在完全不同的螢幕角落，尤其現在 window_region
+    # 盲搜命中的座標可能落在整個瀏覽器視窗任何地方），距離常常差到 5-10 倍以上。
+    # 總耗時卻只能跟著變 0.6x-1.45x，結果就是近距離被硬拉長、看起來很慢，遠距離
+    # 沒跟著拉長、只能用飛的衝過去、看起來很快——這就是「有時候很快有時候很慢」
+    # 的真正原因，是系統性地被這個過窄的 clamp 決定的，不是隨機。開根號縮放
+    # （距離變 4 倍、時間約變 2 倍）比較接近真人「距離越遠移動越快」的直覺，
+    # clamp 範圍也拉寬到能涵蓋近距離跟跨螢幕遠距離兩種極端。
+    distance_ratio = clamp((distance / max(1, template["distance"])) ** 0.5, 0.45, 2.3)
     total_duration = (template["durationMs"] / 1000) * speed_ratio * distance_ratio * random.uniform(0.92, 1.10)
-    total_duration = clamp(total_duration, 0.28, 2.20)
+    total_duration = clamp(total_duration, 0.28, 3.2)
 
     previous_t = 0.0
     previous_x = start_x
@@ -795,9 +876,13 @@ def smooth_move_mouse_to(target_x, target_y, duration=1.7, steps=64):
     start_x, start_y = get_mouse_position()
     pattern = random.choice(MOVE_PATTERNS)
     distance = max(1, math.hypot(target_x - start_x, target_y - start_y))
-    distance_factor = clamp(distance / 620, 0.70, 1.12)
-    duration = duration * pattern.get("speed", 1.0) * distance_factor * random.uniform(0.88, 1.08)
-    steps = int(clamp(steps * pattern.get("step_scale", 1.0) * clamp(distance / 620, 0.76, 1.12), 12, 150))
+    # 跟 replay_user_trace_template() 同一個毛病、同一個修法：原本 clamp(距離/620,
+    # 0.70, 1.12) 幾乎不管實際距離多遠，總耗時都差不多，導致近距離看起來被拖慢、
+    # 遠距離看起來用飛的——開根號縮放＋拉寬 clamp 範圍，讓總耗時比較合理地跟著
+    # 實際距離變化，兩個函式的移動速度感受才會一致。
+    distance_scale = clamp((distance / 620) ** 0.5, 0.5, 2.3)
+    duration = duration * pattern.get("speed", 1.0) * distance_scale * random.uniform(0.88, 1.08)
+    steps = int(clamp(steps * pattern.get("step_scale", 1.0) * clamp((distance / 620) ** 0.5, 0.6, 1.9), 12, 220))
     p0, p1, p2, p3 = make_control_points(start_x, start_y, target_x, target_y, pattern)
     weights = []
     total_weight = 0
@@ -911,16 +996,24 @@ def _draw_target_marker_impl(x, y, box, region, region_label, source_label):
 
     import tkinter as tk
 
-    if region is not None:
-        width = int(clamp(region["width"] + MARKER_PADDING, MARKER_MIN_SIZE, MARKER_MAX_SIZE))
-        height = int(clamp(region["height"] + MARKER_PADDING, MARKER_MIN_SIZE, MARKER_MAX_SIZE))
-        window_left = region["left"] + region["width"] / 2 - width / 2
-        window_top = region["top"] + region["height"] / 2 - height / 2
-    elif box is not None:
+    # 提醒視窗（透明疊層）本身的畫布最大只有 MARKER_MAX_SIZE 見方，置中的基準
+    # 優先看 box（真的比對到的 checkbox 精確範圍）而不是 region：region 現在
+    # 除了 dom_region（單一候選元件的外框，通常不大）之外，也可能是 window_region
+    # （整個瀏覽器視窗內容區，動輒 1500x900 起跳，遠超過 MARKER_MAX_SIZE）。
+    # 如果還是拿 region 置中，checkbox 真正的位置很容易落在視窗中心以外，被
+    # 裁到畫布外面完全看不到——即使滑鼠確實移動過去了，畫面上卻沒有任何標記，
+    # 使用者看起來又是一個「空白提醒視窗」。box 有的話一定用 box 置中，region
+    # 只有在 box 沒有（真的沒比對到 checkbox）時才當退路。
+    if box is not None:
         width = int(clamp(box["width"] + MARKER_PADDING, MARKER_MIN_SIZE, MARKER_MAX_SIZE))
         height = int(clamp(box["height"] + MARKER_PADDING, MARKER_MIN_SIZE, MARKER_MAX_SIZE))
         window_left = box["left"] + box["width"] / 2 - width / 2
         window_top = box["top"] + box["height"] / 2 - height / 2
+    elif region is not None:
+        width = int(clamp(region["width"] + MARKER_PADDING, MARKER_MIN_SIZE, MARKER_MAX_SIZE))
+        height = int(clamp(region["height"] + MARKER_PADDING, MARKER_MIN_SIZE, MARKER_MAX_SIZE))
+        window_left = region["left"] + region["width"] / 2 - width / 2
+        window_top = region["top"] + region["height"] / 2 - height / 2
     else:
         width = height = 240
         window_left = window_top = None
@@ -1040,6 +1133,19 @@ def main():
             "height": payload["height"],
         }
 
+    # background.js 完全沒抓到候選元件時（point 是 null），會退而附上「目前分頁
+    # 所在瀏覽器視窗」的螢幕範圍當 windowRegion（見 getViewportScreenBounds）。
+    # 這裡只當作盲搜範圍的收斂提示，實際還是 locate_target() 自己比對樣板決定。
+    window_region = None
+    wr = payload.get("windowRegion")
+    if isinstance(wr, dict) and all(key in wr for key in ("left", "top", "width", "height")):
+        window_region = {
+            "left": wr["left"],
+            "top": wr["top"],
+            "width": wr["width"],
+            "height": wr["height"],
+        }
+
     # 同一頁重試多次仍找不到 checkbox 時，background.js 的三次嘗試協定會逐次
     # 調低這兩個門檻再傳進來；沒帶就用模組預設值。
     dom_region_min_score = payload.get("domRegionMinScore", DOM_REGION_MIN_SCORE)
@@ -1058,6 +1164,7 @@ def main():
             dom_region,
             dom_region_min_score=dom_region_min_score,
             logo_min_score=logo_min_score,
+            window_region=window_region,
         )
     except Exception:
         match = None
@@ -1089,10 +1196,10 @@ def main():
                 # 不是自動幫真人點掉驗證元件。
                 pattern_name = smooth_move_mouse_to(x, y)
                 moved = True
-                LEFT_DOWN = 0x0002
+                LEFT_DOWN = 0x00020
                 LEFT_UP = 0x0004
                 USER32.mouse_event(LEFT_DOWN, 0, 0, 0, 0)
-                time.sleep(0.1)
+                time.sleep(0.2)
                 USER32.mouse_event(LEFT_UP, 0, 0, 0, 0)
             except Exception:
                 moved = False
@@ -1119,9 +1226,12 @@ def main():
         "pattern": pattern_name,
         # 清楚分開回報「iframe 範圍有沒有拿到」（dom_region 一開始就是
         # background.js 傳進來的，這裡一定是 iframe 已知）跟「checkbox 有沒有
-        # 比對到」，方便直接從 log 判斷是哪一段出問題。
+        # 比對到」，方便直接從 log 判斷是哪一段出問題。windowRegionUsed 額外
+        # 標出這次是不是退到視窗範圍盲搜（沒有任何候選元件時才會是 true），
+        # 讓 log 看得出來這次是精準定位還是視窗範圍盲搜找到的。
         "iframeFound": dom_region is not None,
         "checkboxFound": checkbox_found,
+        "windowRegionUsed": dom_region is None and window_region is not None,
     })
 
 

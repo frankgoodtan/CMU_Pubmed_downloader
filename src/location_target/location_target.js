@@ -180,3 +180,40 @@ async function locateTargetElement(tabId, selector, options) {
   const all = await locateAllTargetElements(tabId, selector, options);
   return all.length ? all[0] : null;
 }
+
+// locateAllTargetElements 一個候選都抓不到時（background.js 完全沒辦法用 DOM
+// 定位到任何已知的驗證挑戰元件），native host 至少還能把盲搜範圍收斂到「目前
+// 分頁所在瀏覽器視窗」的螢幕範圍，而不是整個虛擬桌面（含其他螢幕/桌面/工作列，
+// 誤判率高很多，見 python_write_love.py 的 ENABLE_BLIND_FULLSCREEN_SEARCH）。
+// 沿用 rectToScreenPoint() 同一套換算公式：把 rect 設成「整個 viewport 本身」
+// （left/top=0,0、width/height=innerWidth/innerHeight），算出來就是視窗內容區
+// 的螢幕絕對範圍。
+async function getViewportScreenBounds(tabId) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        dpr: window.devicePixelRatio || 1,
+      }),
+    });
+    const info = injection?.result;
+    if (!info || !info.innerWidth || !info.innerHeight) return null;
+
+    const tab = await chrome.tabs.get(tabId);
+    const windowInfo = await chrome.windows.get(tab.windowId);
+    const point = rectToScreenPoint(
+      {
+        left: 0, top: 0,
+        width: info.innerWidth, height: info.innerHeight,
+        innerWidth: info.innerWidth, innerHeight: info.innerHeight,
+        dpr: info.dpr,
+      },
+      windowInfo
+    );
+    return { left: point.left, top: point.top, width: point.width, height: point.height };
+  } catch {
+    return null;
+  }
+}
