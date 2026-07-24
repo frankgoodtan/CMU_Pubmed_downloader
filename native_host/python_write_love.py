@@ -1019,6 +1019,28 @@ def _draw_target_marker_impl(x, y, box, region, region_label, source_label):
         window_left = window_top = None
 
     root = tk.Tk()
+    try:
+        _build_and_run_marker_window(root, x, y, box, region, region_label, source_label,
+                                      width, height, window_left, window_top, debug_label)
+    except Exception:
+        # 下面任何一步出錯（尤其是已經呼叫過 ShowWindow／SetWindowPos(HWND_TOPMOST)
+        # 之後才出錯）：這個視窗會卡在「畫面上看得到、OS 層級永遠置頂，但還沒
+        # 排進 root.after(...)／root.mainloop() 事件迴圈」的半殘狀態——沒有事件
+        # 迴圈的視窗不會回應任何輸入，也不會自己消失，而且因為是 topmost，會
+        # 擋住整個桌面（不只 Chrome）的滑鼠點擊，直到使用者強制切換一次前景
+        # 視窗（例如打開工作管理員）才會鬆手，感覺就像「整台電腦滑鼠突然
+        # 失靈」。不管流程走到哪一步失敗，這裡都要立刻銷毀視窗，不能留著。
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        raise
+
+
+def _build_and_run_marker_window(root, x, y, box, region, region_label, source_label,
+                                  width, height, window_left, window_top, debug_label):
+    import tkinter as tk
+
     root.title("PubMed 下載器：偵測到人機驗證")
     root.attributes("-topmost", True)
     root.configure(bg="white")
@@ -1045,6 +1067,20 @@ def _draw_target_marker_impl(x, y, box, region, region_label, source_label):
     hwnd = root.winfo_id()
     USER32.ShowWindow(hwnd, SW_SHOW)
     USER32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+
+    # 這個視窗故意疊在 checkbox 正上方（整支工具的目的就是標出 checkbox 位置），
+    # 但它本來是一般不透明視窗，會真的擋住底下的滑鼠點擊——顯示的這幾秒內，
+    # 使用者想手動點擊底下的真 checkbox，其實點到的是這層什麼都沒接的提醒視窗，
+    # 感覺就像滑鼠突然失靈。加上 WS_EX_LAYERED | WS_EX_TRANSPARENT 這組擴充視窗
+    # 樣式，讓這個視窗維持照常顯示（畫面看得到），但滑鼠事件全部穿透到底下的
+    # 真實視窗，使用者隨時都能直接點到 checkbox，不受這個提醒疊層影響。
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TRANSPARENT = 0x00000020
+    LWA_ALPHA = 0x00000002
+    ex_style = USER32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    USER32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+    USER32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
 
     canvas = tk.Canvas(root, width=width, height=height, bg="white", highlightthickness=0)
     canvas.pack()
