@@ -705,8 +705,16 @@ USER_TRACE_TEMPLATES = None
 
 
 def latest_checkbox_trace_file():
+    # 專案重構（27558a5）把「真人點擊資料收集」搬到 dev-tools/ 底下，這裡的路徑
+    # 一直沒跟著更新——原本寫死指向 chrome_extension/真人點擊資料收集/，實際
+    # 檔案在 chrome_extension/dev-tools/真人點擊資料收集/，導致這支函式從那次
+    # 重構後就一直找不到檔案，load_user_trace_templates() 永遠回傳空清單，
+    # replay_user_trace_template() 永遠回傳 None：也就是說這段時間所有滑鼠
+    # 移動實際上從來沒有真的用過真人軌跡，一直都是靜默退回
+    # smooth_move_mouse_to() 自己的合成貝茲曲線 fallback，沒有任何錯誤訊息會
+    # 顯示出來（找不到檔案本來就是合法的「沒有錄製檔」情境，不會報錯）。
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    pattern = os.path.join(os.path.dirname(base_dir), "真人點擊資料收集", "mouse_recording", "*_checkbox_100.json")
+    pattern = os.path.join(os.path.dirname(base_dir), "dev-tools", "真人點擊資料收集", "mouse_recording", "*_checkbox_100.json")
     files = glob.glob(pattern)
     if not files:
         return None
@@ -787,85 +795,165 @@ def load_user_trace_templates():
     return USER_TRACE_TEMPLATES
 
 
+# 一次串接播放最多幾段真人軌跡去逼近目標。距離很遠、超過任何單筆錄製涵蓋的
+# 範圍時，靠這個上限避免無窮迴圈（真的撐到上限還沒到，最後會有一次瞬間校正，
+# 見 replay_user_trace_template 結尾）。
+MAX_TRACE_SEGMENTS = 6
+
+
 def replay_user_trace_template(target_x, target_y, duration=1.0):
+    """播放真人錄製軌跡去逼近 (target_x, target_y)，用「片段擷取＋原速原距播放、
+    必要時串接多段」的方式，不對單筆軌跡整體做距離/時間縮放。
+
+    原本的做法是：挑一筆錄製軌跡，把它的 u/v（原始距離的比例）乘上「這次實際
+    要移動的距離」換算回絕對座標，時間也照樣用某個比例縮放——這等於把一整筆
+    真人動作硬拉伸/壓縮成看起來差不多長的另一段動作。距離差很多時（尤其現在
+    有 window_region 盲搜，目標可能離滑鼠很近也可能很遠），這種整體縮放會讓
+    路徑「感覺不對」：明明只要移動一小段，卻套用一整筆為了走完長距離而設計的
+    加速/減速/微調節奏，硬壓縮進很短的時間內，擠出一堆不成比例的抖動；反過來
+    距離很遠時又被拉伸成不自然的緩慢滑行。這樣就失去了「用真人軌跡」的意義
+    ——真人軌跡的價值在於「這段距離真人本來就會怎麼動」，不是「隨便套一段
+    動作再硬伸縮成差不多長」。
+
+    改成：隨機挑一筆錄製軌跡，量出它「原始距離」對應的絕對像素位移／原始時間
+    間隔完全不變，只從頭開始擷取一段——擷取到累積位移大約等於這次還剩下的
+    距離就停（模板比剩下的路長，就只取前面一截；模板比剩下的路短，就整段
+    播完）。每個點的位置＝目前所在點 + 這段模板「原始」位移向量（乘上跟目前
+    方向對齊的旋轉，不縮放大小）、每個點的延遲＝模板「原始」時間間隔，兩者都
+    不做任何比例調整，忠實重現那段錄製當下真人手部實際的移動節奏跟抖動幅度。
+    一段播完還沒到目標，就再挑一筆（可能同一筆也可能不同筆）從新的位置繼續，
+    最多串 MAX_TRACE_SEGMENTS 段——距離再遠也不需要動用任何合成曲線，全程都是
+    真實錄製片段的忠實重播，只是方向跟著剩餘路徑重新對齊。
+    """
     templates = load_user_trace_templates()
     if not templates:
         return None
 
-    start_x, start_y = get_mouse_position()
-    dx = target_x - start_x
-    dy = target_y - start_y
-    distance = max(1, math.hypot(dx, dy))
-    dir_x = dx / distance
-    dir_y = dy / distance
-    normal_x = -dir_y
-    normal_y = dir_x
+    # 錄製資料庫裡最短的一筆距離——目前這批錄製全部是至少 197px 起跳的完整
+    # 伸手動作（normalize_trial_trace 本身也設了 80px 門檻，太短的錄製不收），
+    # 沒有任何一筆代表「短距離修正動作」的真實資料。這代表資料庫裡每一筆的
+    # 側向抖動（v）絕對像素量，天生就是照這個規模的動作設計的——目標距離明顯
+    # 小於這個下限時（例如只剩 30px），套用任何一筆的抖動幅度都會顯得誇張、
+    # 繞一大圈才到，跟距離完全不成比例，跟挑哪筆模板、截哪一段都無關，是
+    # 資料規模對不上。下面用這個當基準，讓抖動幅度按比例縮小。
+    min_template_distance = min(tpl["distance"] for tpl in templates)
 
-    # 挑樣板不再是純隨機——優先挑「原始錄製距離」跟這次實際要移動的距離相近的
-    # 幾筆，再從裡面隨機選一筆（保留一點隨機性，不要每次都選到同一筆，但避免
-    # 選到距離差太懸殊的樣板）。原本純隨機選，選到的樣板距離常常跟實際距離差
-    # 5-10 倍：v（垂直方向的手部自然抖動）是錄製當下用「原始距離的比例」存的，
-    # 套用時是拿現在的實際距離去乘回絕對座標——距離差太多時，這個比例被硬套在
-    # 差很多的實際距離上，短距離會把原本長距離移動的抖動比例壓縮出一堆密集、
-    # 不成比例的鋸齒（看起來又慢又抖），長距離則會把短距離移動的抖動比例放大到
-    # 誇張的擺動幅度。挑距離相近的樣板從根本上減少需要縮放的幅度，比單純調整
-    # distance_ratio 的 clamp 範圍更治本。
-    templates_by_closeness = sorted(templates, key=lambda tpl: abs(tpl["distance"] - distance))
-    pool_size = max(1, len(templates_by_closeness) // 3)
-    template = random.choice(templates_by_closeness[:pool_size])
+    cur_x, cur_y = get_mouse_position()
+    used_trials = []
 
-    # 就算挑了最接近的一批，範圍還是可能差太多（例如收集到的錄製全部都是
-    # 300px 以上的長距離移動，這次卻只要移動 20px）：這種極端情況強行套用
-    # 學來的軌跡意義不大，直接回傳 None，讓呼叫端退回 smooth_move_mouse_to()
-    # 自己的合成貝茲曲線——那條路徑的抖動量是固定的小像素數，不會隨距離縮放，
-    # 短距離移動反而更平滑自然。
-    closest_ratio = distance / max(1, template["distance"])
-    if closest_ratio < 0.3 or closest_ratio > 3.5:
-        return None
+    for _segment in range(MAX_TRACE_SEGMENTS):
+        dx = target_x - cur_x
+        dy = target_y - cur_y
+        dist_left = math.hypot(dx, dy)
+        if dist_left < 3:
+            break
+        dir_x = dx / dist_left
+        dir_y = dy / dist_left
+        normal_x = -dir_y
+        normal_y = dir_x
 
-    speed_ratio = clamp(duration / 1.0, 0.30, 1.60)
-    # 距離比例改用開根號縮放，範圍也拉寬很多。原本 clamp(距離比例, 0.60, 1.45)
-    # 等於「不管實際距離多遠，總耗時都跟錄製當下差不多」——但滑鼠起始位置千變
-    # 萬化（可能離目標很近，也可能在完全不同的螢幕角落，尤其現在 window_region
-    # 盲搜命中的座標可能落在整個瀏覽器視窗任何地方），距離常常差到 5-10 倍以上。
-    # 總耗時卻只能跟著變 0.6x-1.45x，結果就是近距離被硬拉長、看起來很慢，遠距離
-    # 沒跟著拉長、只能用飛的衝過去、看起來很快——這就是「有時候很快有時候很慢」
-    # 的真正原因，是系統性地被這個過窄的 clamp 決定的，不是隨機。開根號縮放
-    # （距離變 4 倍、時間約變 2 倍）比較接近真人「距離越遠移動越快」的直覺，
-    # clamp 範圍也拉寬到能涵蓋近距離跟跨螢幕遠距離兩種極端。
-    distance_ratio = clamp((distance / max(1, template["distance"])) ** 0.5, 0.45, 2.3)
-    total_duration = (template["durationMs"] / 1000) * speed_ratio * distance_ratio * random.uniform(0.92, 1.10)
-    total_duration = clamp(total_duration, 0.28, 3.2)
+        # 挑模板不能純隨機：v（垂直抖動）存的是「模板自己完整距離」的比例，
+        # 一筆 500px 的移動裡有幾十 px 的自然側向擺動很正常，但如果隨機挑到
+        # 這種規模的模板去代表「只剩 30px 要走」的最後一小段，那幾十 px 的
+        # 側向擺動相對 30px 的剩餘距離來說就是誇張的大繞路——這不是位移量被
+        # 縮放了（沒有，忠於原始資料），是「拿一個規模差很多的真實動作去套用
+        # 在規模對不上的情境」，量出來的路徑長度／直線距離比例可以到 10-40 倍。
+        # 這裡優先挑「原始距離」跟剩餘距離規模相近（取最接近的一半數量）的
+        # 模板，保留隨機性但避免規模差太多；規模對得上，抖動幅度才會跟這一段
+        # 實際要走的距離成比例，看起來才自然。
+        by_closeness = sorted(templates, key=lambda tpl: abs(tpl["distance"] - dist_left))
+        pool = by_closeness[:max(3, len(by_closeness) // 2)]
+        template = random.choice(pool)
+        template_distance = max(1, template["distance"])
 
-    previous_t = 0.0
-    previous_x = start_x
-    previous_y = start_y
+        # 就算挑到規模最接近的模板，dist_left 明顯小於資料庫最短樣本
+        # （min_template_distance）時，這筆模板的側向抖動幅度天生還是為更長
+        # 距離設計的，套用起來還是會顯得誇張——資料庫裡沒有更短規模的樣本可挑
+        # 了。這裡不動 u（沿主軸位移）跟時間節奏，只把 v（垂直抖動）的絕對
+        # 像素量按比例縮小：dist_left 達到 min_template_distance 以上完全不縮
+        # （wobble_scale=1，忠於原始資料），越短於這個下限，抖動幅度縮得越小，
+        # 保底留一點點自然擺動（不縮到 0、變成死板的直線）。
+        wobble_scale = clamp(dist_left / min_template_distance, 0.15, 1.0)
 
-    for index, point in enumerate(template["points"]):
-        if index == 0:
-            continue
+        # 這段要涵蓋的距離：模板自己的原始距離跟「剩餘要走的距離」取小——
+        # 模板比剩下的路短或差不多長，整段真人軌跡原速原距播完，下一輪迴圈
+        # 再串接下一段繼續逼近目標；模板比剩下的路還長，只截取一截來用。
+        u_cutoff = clamp(dist_left / template_distance, 0.02, 1.0)
+        if u_cutoff >= 0.999:
+            # 播完整段：不能用「u <= u_cutoff」去篩，真人軌跡常有「衝過頭、
+            # 再修正回來」的自然行為，途中有些點的 u 會略大於 1（見
+            # normalize_trial_trace 允許 u 到 1.25），時間順序上排在最後那個
+            # 强制補上的 (u=1, v=0) 收尾點「之前」。如果還是用 <= 1.0 篩選，
+            # 會把這段真實的「過衝再修正」動作整段濾掉，變成從某個點直接跳到
+            # 終點，反而失真——整段播就是要整段，原始點一個都不丟。
+            points = template["points"]
+        else:
+            # 截取哪一截很重要：截「開頭」還是「結尾」代表的意義完全不同。
+            # 開頭是真人動作的起手/加速階段（手剛開始動、方向還沒完全鎖定），
+            # 結尾才是真人「真的精準收斂到終點」的那段真實動作。這裡是「剩餘
+            # 距離不多、快到目標了」的情境，需要的正是後者——原本改版截的是
+            # 開頭，導致越接近終點，越常把好幾筆不同模板「各自起手的那一下」
+            # 接在一起套用，看起來就像終點附近繞來繞去、不斷重新起步，而不是
+            # 一路收斂進去。改截結尾：先找出結尾這一截在原始模板 u 座標系裡的
+            # 起點 u_start，取 u>=u_start 的點，再把這些點的 u/v/t 都減去
+            # u_start 那個點的值「重新歸零」，讓這一截接在 cur_x/cur_y（目前
+            # 位置）當起點，位移量／時間間隔還是原始值，不縮放。
+            # 這裡要排除 u > 1.0 的「衝過頭」點（真人原始動作偶爾會出現、正常）
+            # ——那些點的位移量是照模板「完整距離」換算的，代表的是原始那次
+            # 動作衝過頭衝了多遠，跟這一截只代表「剩下這一小段距離」完全不成
+            # 比例：模板 500px、剩下只要走 30px，原始衝過頭到 u=1.1 換算出來
+            # 卻可能是 80px 的位移，滑鼠會直接衝過目標一大截才轉回來，變成
+            # 「拐彎+過頭」。u<=1.0 的收尾點本身已經包含真實的減速/精準收斂
+            # 動作，不需要再靠過衝點才自然。
+            u_start = 1.0 - u_cutoff
+            tail_points = [p for p in template["points"] if u_start <= p["u"] <= 1.0]
+            if len(tail_points) < 2:
+                tail_points = template["points"][-2:]
+            base_u = tail_points[0]["u"]
+            base_v = tail_points[0]["v"]
+            base_t = tail_points[0]["t"]
+            points = [
+                {"u": p["u"] - base_u, "v": p["v"] - base_v, "t": p["t"] - base_t}
+                for p in tail_points
+            ]
 
-        t = clamp(point["t"], previous_t, 1.0)
-        x = start_x + dir_x * distance * point["u"] + normal_x * distance * point["v"]
-        y = start_y + dir_y * distance * point["u"] + normal_y * distance * point["v"]
+        previous_t = 0.0
+        last_px, last_py = cur_x, cur_y
+        moved_any = False
+        for point in points:
+            if point["u"] <= 0:
+                continue
+            # 沿主軸（u）用模板「原始距離」換算出真實像素位移，完全不縮放；
+            # 垂直方向（v）額外乘上 wobble_scale——目標距離達到資料庫最短樣本
+            # 規模以上時 wobble_scale=1，這裡等於沒有任何調整。
+            px = cur_x + dir_x * (template_distance * point["u"]) + normal_x * (template_distance * point["v"] * wobble_scale)
+            py = cur_y + dir_y * (template_distance * point["u"]) + normal_y * (template_distance * point["v"] * wobble_scale)
+            move_mouse_to(px, py)
+            sleep_for = max(0.001, (point["t"] - previous_t) * (template["durationMs"] / 1000))
+            time.sleep(sleep_for)
+            previous_t = point["t"]
+            last_px, last_py = px, py
+            moved_any = True
 
-        if index >= len(template["points"]) - 2:
-            settle = (index - (len(template["points"]) - 2)) / 2
-            x = x * (1 - settle) + target_x * settle
-            y = y * (1 - settle) + target_y * settle
+        # 這段結束時「真正」走到的位置，必須是滑鼠實際被 move_mouse_to() 移到
+        # 的那個點（含垂直抖動 v），不能只算沿主軸方向的位移量——如果這段是
+        # 被截斷的片段（u_cutoff < 1），最後一個點的 v 不見得是 0，手還在偏移量
+        # 不小的半路上，跟「已經收斂回主軸」是兩回事。記錯成只有主軸分量，
+        # 下一段算方向/剩餘距離時基準點就跟滑鼠實際位置對不上，累積下來會越
+        # 跑越偏（垂直方向偏移沒被算進去，殘留誤差就是被忽略掉的那段 v）。
+        if moved_any:
+            cur_x, cur_y = last_px, last_py
+        used_trials.append(template.get("trial"))
 
-        move_mouse_to(x, y)
-        sleep_for = max(0.001, (t - previous_t) * total_duration)
-        time.sleep(sleep_for)
-        previous_t = t
-        previous_x = x
-        previous_y = y
+        # 真人多段修正動作之間常有短暫停頓（重新對準下一段方向），不是無縫接軌。
+        if math.hypot(target_x - cur_x, target_y - cur_y) >= 3:
+            time.sleep(random.uniform(0.03, 0.09))
 
-    if math.hypot(previous_x - target_x, previous_y - target_y) > 1.5:
+    if math.hypot(cur_x - target_x, cur_y - target_y) > 1.5:
         move_mouse_to(target_x, target_y)
         time.sleep(random.uniform(0.025, 0.075))
 
-    return f"learned_user_trace_{template['trial']}"
+    return "learned_user_trace_segments_" + "_".join(str(t) for t in used_trials) if used_trials else None
 
 
 def smooth_move_mouse_to(target_x, target_y, duration=1.7, steps=64):
@@ -970,6 +1058,49 @@ MARKER_MIN_SIZE = 160
 MARKER_MAX_SIZE = 900
 
 
+def _show_and_topmost_without_locking_shell(hwnd):
+    """把 hwnd 顯示出來並設成 OS 層級置頂，同時避免卡住工作列。
+
+    這支腳本是 Chrome native messaging 在背景生出來的 process，呼叫當下真正的
+    前景視窗通常是 Chrome（background.js 在 activateVerificationEntry() 裡已經
+    先用 chrome.windows.update({focused:true}) 把它切到前景）。Windows 預設不准
+    背景 process 隨便搶前景/置頂排序權，直接呼叫 SetWindowPos(HWND_TOPMOST) 在
+    某些情況下會讓 Shell（工作列）卡在「前景視窗鎖定」等待狀態，直到使用者手動
+    切換一次前景視窗（例如打開工作管理員）才會恢復——這正是實測回報的症狀
+    （提醒視窗本身有沒有正常顯示、有沒有正常消失都沒問題，問題是工作列在這之後
+    點不動）。
+
+    標準解法：用 AttachThreadInput 把這個 process 的輸入佇列跟目前真正前景視窗
+    （Chrome）所屬的執行緒接在一起，暫時借用它的前景權限做 ShowWindow／
+    SetForegroundWindow／SetWindowPos(TOPMOST)，做完立刻分開，不留殘留狀態——
+    這是很多背景工具（例如提醒小工具、通知彈窗）用來可靠搶到前景/置頂又不觸發
+    這個鎖定機制的常見做法。
+
+    這一段沒辦法在開發環境重現問題本身，是憑 Windows 這個已知機制的行為推出來
+    的修法，還是要實測才能確認真的解決。
+    """
+    SW_SHOW = 5
+    HWND_TOPMOST = -1
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
+
+    kernel32 = ctypes.windll.kernel32
+    this_thread_id = kernel32.GetCurrentThreadId()
+    foreground_hwnd = USER32.GetForegroundWindow()
+    foreground_thread_id = USER32.GetWindowThreadProcessId(foreground_hwnd, 0) if foreground_hwnd else 0
+
+    attached = False
+    if foreground_thread_id and foreground_thread_id != this_thread_id:
+        attached = bool(USER32.AttachThreadInput(this_thread_id, foreground_thread_id, True))
+
+    try:
+        USER32.ShowWindow(hwnd, SW_SHOW)
+        USER32.SetForegroundWindow(hwnd)
+        USER32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+    finally:
+        if attached:
+            USER32.AttachThreadInput(this_thread_id, foreground_thread_id, False)
+
+
 def draw_target_marker(x=None, y=None, box=None, region=None, region_label=None, source_label=None):
     """對外的入口：實際畫圖包在 _draw_target_marker_impl 裡，這裡只負責接住任何
     例外並寫進除錯資料夾的 log 檔——Chrome 啟動 native host 時不會保留一個看得到
@@ -1061,12 +1192,8 @@ def _build_and_run_marker_window(root, x, y, box, region, region_label, source_l
     # 導致視窗其實建立成功、畫面也畫了，但整個不可見。直接呼叫 Win32
     # ShowWindow／SetWindowPos 蓋過 Tk 自己的判斷，強制顯示＋置頂，多一層保險。
     root.update_idletasks()
-    SW_SHOW = 5
-    HWND_TOPMOST = -1
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW = 0x0002, 0x0001, 0x0040
     hwnd = root.winfo_id()
-    USER32.ShowWindow(hwnd, SW_SHOW)
-    USER32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+    _show_and_topmost_without_locking_shell(hwnd)
 
     # 這個視窗故意疊在 checkbox 正上方（整支工具的目的就是標出 checkbox 位置），
     # 但它本來是一般不透明視窗，會真的擋住底下的滑鼠點擊——顯示的這幾秒內，
