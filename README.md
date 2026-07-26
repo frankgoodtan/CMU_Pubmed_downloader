@@ -1,6 +1,7 @@
 # PubMed PDF 批次下載器 v6
 
-Chrome 擴充功能，讓 CMU（中國醫藥大學）研究人員透過 EZproxy 批次下載 PubMed 論文 PDF created by PBCM 38 譚皓宇  有bug回報 line 把debug資料夾複製一份以便查看問題
+Chrome 擴充功能，讓 CMU（中國醫藥大學）研究人員透過 EZproxy 批次下載 PubMed 論文 PDF created by PBCM 38 譚皓宇 with Claude協作等 有bug回報 line 
+把debug資料夾複製一份以便查看問題
 
 支援並行下載（1/2/3/5 篇同時跑）、多出版商（Elsevier/ScienceDirect、JAMA/Silverchair、PMC、Wiley、Springer、SciELO、SAGE、OUP 等）、本地資料夾模式（PDF／失敗筆記／進度 Excel 直接存到你自選的資料夾）、人機驗證偵測與提醒。
 本專案只適用window 作業系統
