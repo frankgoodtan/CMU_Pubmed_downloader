@@ -1359,7 +1359,7 @@ def main():
                 # 不是自動幫真人點掉驗證元件。
                 pattern_name = smooth_move_mouse_to(x, y)
                 moved = True
-                LEFT_DOWN = 0x00020
+                LEFT_DOWN = 0x0002
                 LEFT_UP = 0x0004
                 USER32.mouse_event(LEFT_DOWN, 0, 0, 0, 0)
                 time.sleep(0.2)

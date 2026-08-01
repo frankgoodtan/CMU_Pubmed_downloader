@@ -4,18 +4,27 @@
 
 這個擴充功能的 manifest.json 釘了一個固定的 "key"，Chrome 會用這個 key
 算出固定的擴充功能 ID——也就是說 ID 其實不用開 Chrome 去 chrome://extensions
-複製，直接從 manifest.json 算就好。setup.ps1 / 一鍵安裝.bat 做的就是這件事，
-再加上裝好底下兩個 native host：
-  1. com.pubmed_downloader.write_love    — 人機驗證畫愛心提醒
-  2. com.pubmed_downloader.file_manager  — 本地資料夾模式讀寫、debug log 留痕
+複製，直接從 manifest.json 算就好。一鍵安裝.bat 做的就是這件事，再加上：
+  0. 用 native_host/requirements.txt 一次裝齊全部 native host 需要的
+     Python 套件（opencv-python / mss / numpy / openai-whisper，不用再
+     分開手動下兩三行 pip install）
+  1. com.pubmed_downloader.write_love      — 人機驗證畫愛心提醒
+  2. com.pubmed_downloader.file_manager    — 本地資料夾模式讀寫、debug log 留痕
+  3. com.pubmed_downloader.captcha_solver  — EZproxy 重登語音驗證碼自動辨識（選用，
+     見下面第三段安裝說明；沒裝的話重登入一律照舊跳出來要你手動輸入，不影響
+     其他功能）
 
 用法：
   雙擊 chrome_extension 資料夾最上層（跟這份說明文件同一層）的「一鍵安裝.bat」，
-  跳出的黑底視窗跑完、按任意鍵關掉即可（會自動幫你開一個 chrome://extensions
-  分頁）。
+  跳出的黑底視窗會先跑 pip 安裝套件（第一次跑因為要下載 openai-whisper 連帶
+  的 torch，檔案較大，需要一點時間，耐心等它跑完，不要關掉視窗），再註冊
+  native host，最後按任意鍵關掉即可。
 
-  不想雙擊 .bat 的話，也可以在 native_host 資料夾開 cmd，貼上：
+  只想重新註冊 native host、不想重跑 pip 安裝的話（例如套件已經裝過了），
+  可以在 native_host 資料夾開 cmd，貼上：
       powershell -ExecutionPolicy Bypass -File setup.ps1
+  只想重新安裝 Python 套件、不想動 native host 註冊的話：
+      pip install -r requirements.txt
 
 這個指令做不到、也不該做到的事：把未封裝的擴充功能自動載入 Chrome。這是
 Chrome 刻意設計的安全機制（載入未簽署的 dev 擴充功能一定要使用者手動點
@@ -40,13 +49,13 @@ Chrome 刻意設計的安全機制（載入未簽署的 dev 擴充功能一定�
 
          powershell -ExecutionPolicy Bypass -File install_all.ps1 -ExtensionId 你的ID
 
-  3) 看到兩段「Installed native messaging host: ...」輸出代表都裝好了。
+  3) 看到三段「Installed native messaging host: ...」輸出代表都裝好了。
 
   4) 回 chrome://extensions 把擴充功能重新整理一次即可。
 
 如果之後只有其中一個 host 需要重裝（例如只是這支 Python 腳本本身改了
-路徑），還是可以只跑對應那支 install_write_love.ps1 / install_file_manager.ps1，
-不需要每次都兩個一起重裝。
+路徑），還是可以只跑對應那支 install_write_love.ps1 / install_file_manager.ps1 /
+install_captcha_solver.ps1，不需要每次都三個一起重裝。
 
 ====================================================================
 人機驗證畫愛心 — Native Messaging Host 安裝說明
@@ -62,9 +71,12 @@ Chrome 刻意設計的安全機制（載入未簽署的 dev 擴充功能一定�
 前置需求：
   - 這台電腦要有裝 Python（命令提示字元打 python --version 或
     py --version 能看到版本號即可）。
-  - 裝好下面三個套件（python_write_love.py 啟動後會自己掃描螢幕、
-    比對 checkbox_template.png 找目標座標，需要這些套件才能執行）：
-        pip install opencv-python mss numpy
+  - 裝好 opencv-python / mss / numpy 這三個套件（python_write_love.py
+    啟動後會自己掃描螢幕、比對 checkbox_template.png 找目標座標，需要
+    這些套件才能執行）。用一鍵安裝.bat 會自動幫你裝（連同其他 host 需要
+    的套件一起，見 native_host/requirements.txt）；不想用一鍵安裝的話
+    手動跑：
+        pip install -r requirements.txt
   - Chrome 已經載入這個擴充功能（未封裝／開發者模式），且已重新整理
     過，確保用的是含 nativeMessaging 權限的最新版 manifest.json。
 
@@ -126,7 +138,8 @@ Chrome 刻意設計的安全機制（載入未簽署的 dev 擴充功能一定�
     python --version 或 py --version 能正常顯示版本號；如果都沒有，
     要先安裝 Python 並確保有加入 PATH。
   - 跳出 ModuleNotFoundError（cv2 / mss / numpy）：代表前置需求那三個
-    套件沒裝，跑 pip install opencv-python mss numpy 補裝即可。
+    套件沒裝，跑 pip install -r requirements.txt 補裝即可（在 native_host
+    資料夾底下）。
 
 ====================================================================
 本地資料夾模式 — 第二個 Native Messaging Host 安裝說明
@@ -182,3 +195,72 @@ Chrome 刻意設計的安全機制（載入未簽署的 dev 擴充功能一定�
     功能會自動退回原本的 chrome.downloads 下載方式，不影響既有功能。
   - 想看詳細錯誤：native_host\file_manager_debug\ 資料夾（第一次出錯時
     才會自動建立）裡的 ERROR_*.txt。
+
+====================================================================
+EZproxy 重登語音驗證碼自動辨識 — 第三個 Native Messaging Host 安裝說明（選用）
+====================================================================
+
+用途：
+  整批下載期間 CMU EZproxy 的登入 session 可能會失效（例如跑了很久、或
+  cookie 被清理過），需要重新登入。第一次登入永遠是你自己手動輸入帳號、
+  密碼、驗證碼；成功後帳密只存在擴充功能背景程式的記憶體裡（不會寫進
+  硬碟、不會留檔案），重新載入擴充功能或關掉瀏覽器就會清空、下次要重新
+  輸入。裝了這個 host 之後，同一次執行期間如果又被導回登入頁，會先自動
+  抓登入頁上的語音驗證碼（螢幕上「播放語音」那個按鈕對應的音檔），交給
+  這支腳本用 OpenAI Whisper（tiny 模型，離線在你自己電腦上跑，不會把
+  語音檔傳到任何外部伺服器）辨識出數字，自動幫你重新登入，不用你回來
+  手動輸入。
+
+  沒有裝這個 host 的話，重登入會照舊跳出來要你手動輸入，不影響其他任何
+  功能——這是完全選用的功能。
+
+  為什麼是語音、不是圖片驗證碼：實測過用圖片辨識（樣板比對），整組 4 碼
+  對的機率不到 2 成，不夠可靠拿來自動送出；同一組驗證碼的語音版本用
+  Whisper tiny 模型辨識，實測準確率高很多。就算辨識偶爾出錯，也設計了
+  安全網：自動送出失敗會換一組驗證碼重試（最多 3 次），還是不行就自動
+  退回原本手動輸入的流程，不會無限重試、也不會讓整批下載卡住。
+
+前置需求：
+  - 這台電腦要有裝 Python（同其他兩個 host）。
+  - 裝好 openai-whisper / numpy 這兩個套件（比 write_love 用的
+    opencv-python/mss/numpy 重不少，因為連帶會裝 torch，大約要幾百 MB，
+    第一次安裝需要一點時間）。這些套件已經合併進 native_host/requirements.txt，
+    用一鍵安裝.bat 會自動裝好（連同 write_love 需要的套件一起），不用
+    再分開手動下 pip；只想單獨補裝套件的話：
+        pip install -r requirements.txt
+  - 第一次執行時，腳本會自動從網路下載 Whisper tiny 模型檔（約 75MB），
+    存進使用者設定檔底下的快取資料夾，之後執行會直接讀快取、不用再下載。
+
+安裝步驟（跟前兩個 host 幾乎一樣，只是換一支腳本）：
+
+  1) 取得擴充功能 ID（同上面步驟，三個 host 共用同一個 ID）。
+
+  2) 在 native_host 資料夾開 cmd，貼上：
+
+         powershell -ExecutionPolicy Bypass -File install_captcha_solver.ps1 -ExtensionId 你的ID
+
+  3) 看到類似下面的輸出代表安裝成功：
+
+         Installed native messaging host: com.pubmed_downloader.captcha_solver
+           manifest:  ...\com.pubmed_downloader.captcha_solver.json
+           bat:       ...\python_captcha_solver.bat
+           extension: chrome-extension://你的ID/
+
+  4) 回 chrome://extensions 把擴充功能重新整理一次即可。這個功能沒有獨立
+     的測試按鈕——第一次登入照常手動輸入，等整批下載期間真的又被導回
+     登入頁時，才會看到 log 裡出現「自動重登：語音驗證碼辨識為...」這類
+     訊息，代表有生效。
+
+解除安裝：
+      reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.captcha_solver" /f
+
+疑難排解：
+  - log 裡一直看到「自動重登：語音驗證碼擷取失敗」或「語音驗證碼辨識
+    失敗」：native host 可能沒裝好，或 pip 套件沒裝齊，回到上面 1)～3)
+    重跑一次、確認 pip install -r requirements.txt 有成功執行完。連續
+    失敗 3 次會自動退回手動輸入，不影響下載繼續跑。
+  - 想看詳細錯誤：native_host 資料夾底下暫時還沒有專屬的 debug 資料夾，
+    可從 chrome://extensions 該擴充功能卡片點「service worker」開發者
+    工具，看 Console 有沒有 "Captcha audio solver" 開頭的紅字/警告。
+  - ModuleNotFoundError（whisper / torch / numpy）：pip install
+    -r requirements.txt 沒裝成功，重新執行一次，注意看有沒有紅字。

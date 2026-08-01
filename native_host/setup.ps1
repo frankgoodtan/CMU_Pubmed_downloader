@@ -15,8 +15,9 @@
   That means the ID can be computed offline, without ever starting Chrome.
   This script does exactly that, then reuses the same registration logic
   as install_all.ps1 to install:
-    - com.pubmed_downloader.write_love    (畫愛心人機驗證提醒)
-    - com.pubmed_downloader.file_manager  (本地資料夾模式讀寫 + debug log 留痕)
+    - com.pubmed_downloader.write_love      (畫愛心人機驗證提醒)
+    - com.pubmed_downloader.file_manager    (本地資料夾模式讀寫 + debug log 留痕)
+    - com.pubmed_downloader.captcha_solver  (EZproxy 重登語音驗證碼辨識，選用)
 
   What this script does NOT do (and deliberately can't): silently load the
   unpacked extension into Chrome. Chrome requires an explicit, visible user
@@ -124,7 +125,17 @@ Install-NativeHost -Name "com.pubmed_downloader.file_manager" `
     -BatFileName "python_file_manager.bat" `
     -ResolvedExtensionId $ExtensionId
 
+Install-NativeHost -Name "com.pubmed_downloader.captcha_solver" `
+    -Description "PubMed PDF Downloader - EZproxy re-login audio captcha solver" `
+    -BatFileName "python_captcha_solver.bat" `
+    -ResolvedExtensionId $ExtensionId
+
 Write-Host "All native messaging hosts installed for extension chrome-extension://$ExtensionId/"
+Write-Host ""
+Write-Host "Note: this only registers the native hosts. All Python packages they need"
+Write-Host "(including openai-whisper/torch for com.pubmed_downloader.captcha_solver)"
+Write-Host "are listed in requirements.txt in this folder - run"
+Write-Host "'pip install -r requirements.txt' once (一鍵安裝.bat does this automatically)."
 Write-Host ""
 Write-Host "Remaining manual step (Chrome requires this be done by hand, once per browser profile):"
 Write-Host "  1. Open chrome://extensions"

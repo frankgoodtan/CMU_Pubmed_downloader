@@ -760,16 +760,94 @@ function buildPdfCandidatesFromUrl(url) {
   }
 }
 
+// 目前分頁是否停在一個 403 Forbidden / Access denied 錯誤頁（沿用
+// getCurrentPageFailureReason 既有的偵測文字，跟下載失敗 txt 裡顯示的原因一致）。
+async function isForbiddenPage(tabId) {
+  const reason = await getCurrentPageFailureReason(tabId).catch(() => "");
+  return /403|forbidden|access denied/i.test(reason || "");
+}
+
+// 防盜連重試：先導到 url 同網域的首頁，再用頁面內真正的 <a> 超連結點擊（不是
+// chrome.tabs.update 那種位址列導航）導去 url，讓瀏覽器自然帶上正確的 Referer。
+// 連首頁都連不上、或重試後仍是 403，就回傳 null，呼叫端維持原本的 finalUrl 不受影響。
+async function retryWithRefererFromOrigin(tabId, url) {
+  let origin;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    return null;
+  }
+
+  await navigateAndWaitStable(tabId, origin, 1000, 8000);
+  if (await isForbiddenPage(tabId)) return null;
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: targetUrl => {
+        const a = document.createElement("a");
+        a.href = targetUrl;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      },
+      args: [url]
+    });
+  } catch {
+    return null;
+  }
+
+  const start = Date.now();
+  let lastUrl = "";
+  while (Date.now() - start < 15000) {
+    await sleep(400);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) break;
+    lastUrl = tab.url || lastUrl;
+    if (tab.status !== "loading" && lastUrl) break;
+  }
+
+  if (await isForbiddenPage(tabId)) return null;
+  return lastUrl || null;
+}
+
 // ── 萬用兜底：以上都判斷不到平台時使用 ──
 async function getPdfFromGenericPage(tabId, url) {
   try {
     const u = new URL(url);
-    if (/\.pdf(?:$|[?#])/i.test(url) || /\/(?:pdf|epdf)\//i.test(u.pathname)) {
+    // attachType=PDF（journaltcm.cn 這類「下載檔案」端點的常見寫法）：query string
+    // 已經明講這是個直接吐檔案的下載端點，不是文章頁，沒有頁面內容/連結可找。
+    // 這種端點常見有防盜連（見下面 retryWithRefererFromOrigin 的說明），但那招是
+    // 「先開首頁、再點頁面內真超連結」，對這種端點沒用——它回的是
+    // Content-Disposition: attachment，真的點下去會觸發瀏覽器原生下載、被
+    // chrome.downloads 接走，不是我們這裡能攔截處理的頁面導航，反而會讓真正的
+    // 下載內容在背景不受控地存到 Chrome 預設資料夾。這裡直接把網址本身當成
+    // pdfUrl 候選回傳，交給後面 preflightPdfCheck／實際下載那段用 fetch()
+    // 帶正確 Referer 去抓（見 sameOriginReferrer()），不要先浪費時間導航分頁。
+    if (/\.pdf(?:$|[?#])/i.test(url) || /\/(?:pdf|epdf)\//i.test(u.pathname) ||
+        /(?:^|[?&])attachType=PDF(?:&|$)/i.test(u.search)) {
       return url;
     }
   } catch {}
 
-  const finalUrl = await navigateAndWaitStable(tabId, url, 2000, 20000);
+  let finalUrl = await navigateAndWaitStable(tabId, url, 2000, 20000);
+
+  // 有些小型出版商的下載端點會做防盜連（Referer 檢查）：要求請求是「從自己站
+  // 內文章頁點下載按鈕過去的」，不接受沒有 Referer 的直接連結（例如
+  // journaltcm.cn 的 downloadArticleFile.do，直接連過去會回 403 Forbidden，
+  // 即使不透過任何 proxy、直接用 curl 測試也一樣，證實是站方自己的防護，跟
+  // CMU 網路/授權無關）。navigateAndWaitStable 用的 chrome.tabs.update()
+  // 就是「位址列貼網址」那種導航，天生不帶 Referer，正好踩到這類防護。
+  // 偵測到 403 時重試一次：先導到同網域首頁建立正常瀏覽情境，再用頁面內真正
+  // 的 <a> 超連結點擊（而不是位址列導航）導去原本網址，讓瀏覽器自動帶上正確
+  // 的 Referer——這招對「真的沒有這篇/沒授權」的 403 沒有幫助，但對純粹的
+  // Referer 檢查型防盜連應該有效，且失敗也不影響原本流程（retryWithRefererFromOrigin
+  // 拿不到更好的結果就回傳 null，維持原本的 finalUrl）。
+  if (await isForbiddenPage(tabId)) {
+    const retried = await retryWithRefererFromOrigin(tabId, url);
+    if (retried) finalUrl = retried;
+  }
+
   const currentUrl = finalUrl || url;
   if (/zhenciyanjiu\.cn/i.test(currentUrl) || /zhenciyanjiu\.cn/i.test(url)) {
     const zcyPdf = await getPdfFromZhenciYanjiu(tabId, currentUrl);

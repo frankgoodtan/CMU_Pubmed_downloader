@@ -1,0 +1,20 @@
+# 這個擴充功能全部 native host 需要的 Python 套件，一次裝齊：
+#     pip install -r requirements.txt
+# 一鍵安裝.bat 會自動執行這行，不需要手動跑；這份檔案主要是給想自己手動裝、
+# 或想知道到底裝了什麼的人看。
+#
+# opencv-python / mss：python_write_love.py 用來對螢幕做樣板比對，找出人機
+#   驗證 checkbox 的座標。
+# numpy：python_write_love.py（樣板比對）跟 python_captcha_solver.py
+#   （音訊重取樣、whisper 底層）都會用到。
+# openai-whisper：python_captcha_solver.py 用來辨識 EZproxy 重登頁的語音
+#   驗證碼（選用功能——沒有這個套件，重新登入一律照舊跳出來手動輸入，
+#   不影響其他任何功能）。會連帶裝 torch，檔案較大（幾百 MB），第一次安裝
+#   需要一點時間。
+#
+# python_file_manager.py（本地資料夾模式讀寫）不需要任何額外套件，只用
+# Python 內建的標準函式庫，所以沒有列在這裡。
+opencv-python
+mss
+numpy
+openai-whisper

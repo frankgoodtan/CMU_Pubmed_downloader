@@ -97,7 +97,21 @@ function toEzproxyCnkiUrl(rawUrl) {
 }
 
 // 打 chndoi.org DOI 解析服務，從回傳的「多重解析地址選擇頁面」HTML 裡抓出
-// 「境外」（link.oversea.cnki.net）連結，並轉成 EZproxy 代理網址。
+// 「境外」（link.oversea.cnki.net）連結。
+//
+// link.oversea.cnki.net 這個網域本身只是一個轉發用的短網址，實際文章內容在
+// CNKI 內部會再重定向到 oversea.cnki.net/kcms2/article/abstract?... 這個網域
+// （跟 CNKI_PORTAL_URL 用的是同一個網域）。這裡曾經直接把 link.oversea.cnki.net
+// 轉成 EZproxy 代理網址（link-oversea-cnki-net.autorpa.cmu.edu.tw）去導航，
+// 結果卡在 EZproxy 的「Warmup Page」、回應 Host does not match——EZproxy 設定檔
+// 顯然沒有把 link.oversea.cnki.net 登記成可代理的資源（只登記了 oversea.cnki.net
+// 那組網域，portal 網址能正常打通就是證明）。手動測試證實：不經代理直接開
+// link.oversea.cnki.net 會被 CNKI 自己重定向到 oversea.cnki.net/kcms2/...，
+// 這個重定向後的網址才是真正有下載按鈕的文章頁，而且網域正好是 EZproxy 認得的
+// 那個。所以這裡改成：先用不經代理的 fetch（redirect: "follow"）把
+// link.oversea.cnki.net 這條轉發鏈追完，拿到 resp.url（重定向後的最終網址），
+// 再對這個最終網址套用 EZproxy 轉換規則去導航——不是對 chndoi.org 給的原始
+// 「境外」網址套用。
 // 回傳 { ok, href?, reason?, url }。
 async function resolveOverseaArticleHrefViaChndoi(doi) {
   const url = buildChndoiResolverUrl(doi);
@@ -115,8 +129,21 @@ async function resolveOverseaArticleHrefViaChndoi(doi) {
   if (!match) {
     return { ok: false, reason: "chndoi.org DOI 解析頁未找到「境外」連結，可能查無此 DOI 或頁面結構已變動", url };
   }
-  const ezproxyHref = toEzproxyCnkiUrl(match[1]);
-  return { ok: true, href: ezproxyHref, rawHref: match[1], url };
+
+  const shortLinkHref = match[1];
+  let finalRawHref = shortLinkHref;
+  try {
+    const followed = await fetch(shortLinkHref, { redirect: "follow" });
+    // followed.url 是追完轉發鏈後瀏覽器實際落地的網址；追不到重定向（例如
+    // 這條短網址本身失效了）就退回原始網址，讓後面照舊嘗試代理過去。
+    if (followed?.url) finalRawHref = followed.url;
+  } catch {
+    // 追蹤失敗（網路錯誤等）不當作致命錯誤——退回原始 link.oversea.cnki.net
+    // 網址，維持修正前的行為當保底，不讓整個 DOI 解析失敗。
+  }
+
+  const ezproxyHref = toEzproxyCnkiUrl(finalRawHref);
+  return { ok: true, href: ezproxyHref, rawHref: finalRawHref, shortLinkHref, url };
 }
 
 // 中文論文查詢流程主入口（含下載）。
@@ -198,7 +225,7 @@ async function runChineseSearchAndDownload(tabId, item, doi, pmid, workerIdx, tr
   const articleHref = resolved.href;
   report.doiFound = stageResult(true, "已透過 chndoi.org 解析到境外文章連結（已轉 EZproxy 代理網址）：" + articleHref);
   rec("已透過 chndoi.org 解析到境外文章連結（已轉 EZproxy 代理網址）：" + articleHref);
-  addThreadLog("Chinese paper search: resolved article href via chndoi.org", { doi, articleHref, rawHref: resolved.rawHref });
+  addThreadLog("Chinese paper search: resolved article href via chndoi.org", { doi, articleHref, rawHref: resolved.rawHref, shortLinkHref: resolved.shortLinkHref });
 
   // 進文章頁 → 點文章頁下載按鈕 → 攔截觸發的下載
   const dl = await downloadCnkiArticleViaClick(tabId, articleHref, downloadName, folder, workerIdx, trace);
@@ -211,6 +238,25 @@ async function runChineseSearchAndDownload(tabId, item, doi, pmid, workerIdx, tr
   rec("目標論文下載成功");
   addThreadLog("Chinese paper search: article download succeeded", { doi, articleHref });
   return { pdfUrl: articleHref, downloaded: true, failureReason: "", report };
+}
+
+// 偵測目前是不是卡在 CNKI 自己的帳號登入頁（o.oversea.cnki.net/newOverseaLogin/...），
+// 不是 CMU EZproxy 那層登入（那層正常，不然連文章頁都進不去）。實測過：同一個
+// session 長時間、大量對 CNKI 發出「進文章頁→點下載」的請求後，CNKI 自己會把
+// 下載請求導去這個帳號登入頁（還帶滑塊驗證），即使是先前才剛下載成功過的同一篇
+// 也一樣會被擋——這是 CNKI 自己的反爬蟲/帳號驗證機制被觸發，不是這篇論文需要
+// 額外授權，也不是 EZproxy 或 CMU 帳號的問題。偵測到就回報，讓呼叫端觸發一次
+// 積極 cookie 清理（清掉 CNKI 自己那組，保留 EZproxy 根網域）再重試，而不是照
+// 一般失敗直接放棄——清掉 CNKI 自己攢的髒 session，下次進 CNKI 入口會重新用
+// EZproxy 通道的 IP 授權取得一份乾淨 session。
+async function isCnkiLoginWallTab(tabId) {
+  if (tabId == null) return false;
+  try {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const url = tab?.url || "";
+    if (/newOverseaLogin|o\.oversea\.cnki\.net.*login/i.test(url)) return true;
+  } catch {}
+  return false;
 }
 
 // 開文章頁（articleHref 是 chndoi.org 解析出來的「境外」連結，導航過去會自動
@@ -337,6 +383,10 @@ async function downloadCnkiArticleViaClick(tabId, articleHref, downloadName, fol
         if (!toggleReady) {
           rec("結果：文章頁上找不到下載開關（a.btn-download-logo），逾時放棄");
           addThreadLog("Chinese paper search: download toggle not found on article page", { articleTabId });
+          // 選擇器一直對不上（CNKI 改版／該篇其實沒有下載開關）沒有實際 HTML 沒辦法
+          // 判斷是哪一種，留一份頁面快照到 debug log，下次再發生時直接從裡面看實際
+          // DOM 長相，不用再靠使用者手動存頁面。
+          await captureVerificationPageSnapshot(articleTabId, "CNKI 文章頁：找不到下載開關").catch(() => {});
           return { ok: false, reason: "文章頁上找不到下載開關（a.btn-download-logo），15 秒內未渲染出來。" };
         }
         rec("已點擊文章頁下載開關，等待 PDF 連結顯示出來");
@@ -375,6 +425,12 @@ async function downloadCnkiArticleViaClick(tabId, articleHref, downloadName, fol
       const captureDeadline = Date.now() + 45000;
       while (adoptedId == null && Date.now() < captureDeadline) await sleep(500);
       if (adoptedId == null) {
+        if (await isCnkiLoginWallTab(popupTabId) || await isCnkiLoginWallTab(articleTabId)) {
+          rec("結果：點擊下載按鈕後被導向 CNKI 帳號登入頁，CNKI session 疑似被反爬蟲機制擋下，排程一次積極 cookie 清理後重試");
+          addThreadLog("Chinese paper search: redirected to CNKI account login wall, requesting cookie cleanup", { articleTabId, popupTabId });
+          requestCookieCleanup("CNKI session 疑似失效（下載請求被導向 CNKI 帳號登入頁，非 EZproxy 登入問題）");
+          return { ok: false, reason: "CNKI session 疑似被反爬蟲機制擋下，已排程清理 cookie 後重試。" };
+        }
         rec("結果：點擊下載按鈕後 45 秒內未攔截到下載，判定失敗");
         addThreadLog("Chinese paper search: no download captured after button click", { articleTabId });
         return { ok: false, reason: "點擊下載按鈕後 45 秒內未觸發下載。" };
@@ -396,9 +452,40 @@ async function downloadCnkiArticleViaClick(tabId, articleHref, downloadName, fol
             return { ok: false, reason: "下載完成但內容是網頁（mime=" + (mime || "?") + "），判定為假檔案。" };
           }
           rec("結果：下載成功");
+          // 這個下載是真的點擊 #pdfDown 觸發、靠 chrome.downloads 完成的（CNKI 的下載
+          // 端點會檢查 Referer，只能用真實點擊鏈，見檔案開頭說明），沒辦法用 fetch()
+          // 重現，只能讓它照舊落地到 Chrome 預設下載資料夾，完成後本地資料夾模式下
+          // 再用 file_manager 把這個已知絕對路徑的檔案「搬」到使用者選的專案資料夾
+          // ——這一步原本漏掉了（LWW 的 downloadViaPageTriggeredDownload 有做同樣的
+          // 事，CNKI 這條路徑當初沒補上），導致本地資料夾模式開著時，CNKI 下載的
+          // 檔案還是會留在 Chrome 下載資料夾，不會出現在使用者選的專案資料夾裡，
+          // 卻照樣被記成「下載成功」。
+          const localCfg = await getLocalFolderConfig();
+          if (localCfg.enabled && it.filename) {
+            try {
+              await fmRequest("move_file", {
+                sourceAbsPath: it.filename,
+                root: localCfg.root,
+                destRelPath: (G.testMode ? TEST_FOLDER_NAME : STATUS_SUCCESS) + "/" + (downloadName || "") + ".pdf",
+              });
+              rec("已搬移至本地專案資料夾");
+            } catch (e) {
+              rec("搬移至本地專案資料夾失敗（" + (e?.message || e) + "），檔案仍留在 Chrome 下載資料夾");
+              addThreadLog("Chinese paper search: move_file to local project failed", { error: e?.message || String(e), source: it.filename });
+            }
+          }
           return { ok: true, reason: "" };
         }
         if (it?.state === "interrupted") {
+          // NETWORK_FAILED 常見成因：#pdfDown 開的彈出分頁其實被導去 CNKI 帳號
+          // 登入頁（HTML），不是真的檔案，chrome.downloads 收到不成串流的內容
+          // 就會直接中斷——不是單純的網路瞬斷。
+          if (await isCnkiLoginWallTab(popupTabId) || await isCnkiLoginWallTab(articleTabId)) {
+            rec("結果：下載中斷，且偵測到被導向 CNKI 帳號登入頁，CNKI session 疑似被反爬蟲機制擋下，排程一次積極 cookie 清理後重試");
+            addThreadLog("Chinese paper search: download interrupted with CNKI login wall detected", { error: it.error, articleTabId, popupTabId });
+            requestCookieCleanup("CNKI session 疑似失效（下載請求被導向 CNKI 帳號登入頁，非 EZproxy 登入問題）");
+            return { ok: false, reason: "CNKI session 疑似被反爬蟲機制擋下，已排程清理 cookie 後重試。" };
+          }
           rec("結果：下載中斷（" + (it.error || "?") + "）");
           addThreadLog("Chinese paper search: download interrupted", { error: it.error });
           return { ok: false, reason: "下載中斷：" + (it.error || "未知原因") };

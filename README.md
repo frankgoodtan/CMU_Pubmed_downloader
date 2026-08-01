@@ -8,11 +8,11 @@ Chrome 擴充功能，讓 CMU（中國醫藥大學）研究人員透過 EZproxy 
 
 ### 0. 前置需求
 - **Google Chrome**
-- **Python 3**（native host 要靠它跑；裝的時候記得勾選「Add python.exe to PATH」）
+- **Python 3**（native host 要靠它跑；裝的時候記得勾選「Add python.exe to PATH」）——所需的 Python 套件（opencv-python / mss / numpy / openai-whisper）已經整理進 [`native_host/requirements.txt`](./native_host/requirements.txt)，下面第 3 步的一鍵安裝會自動幫你 `pip install`，不需要自己手動下指令。想手動裝的話：
   ```
-  pip install opencv-python mss numpy
+  pip install -r native_host/requirements.txt
   ```
-  （只有「畫愛心人機驗證提醒」那個功能需要這三個套件；本地資料夾模式／debug log 那個 host 只用 Python 內建模組）
+  （openai-whisper 只有「EZproxy 重登語音驗證碼自動辨識」需要，連帶會裝 torch，約幾百 MB，第一次安裝要一點時間；不裝這個套件，重新登入一律照舊跳出來手動輸入，不影響其他功能。本地資料夾模式／debug log 那個 host 只用 Python 內建模組，不需要額外套件）
 
 ### 1. 把這個 repo 抓下來
 
@@ -32,7 +32,7 @@ git clone https://github.com/frankgoodtan/CMU_Pubmed_downloader.git
 3. 「載入未封裝項目」→ 選步驟 1 那個看得到 `manifest.json` 的資料夾
 
 ### 3. 一鍵安裝 native host
-雙擊資料夾最上層的 **`一鍵安裝.bat`**：會自動從 `manifest.json` 算出擴充功能 ID（不用自己去 `chrome://extensions` 複製），並註冊好「畫愛心人機驗證提醒」跟「本地資料夾模式／debug log」這兩個 native messaging host。跑完按任意鍵關掉即可，回 `chrome://extensions` 把擴充功能重新整理一次。
+雙擊資料夾最上層的 **`一鍵安裝.bat`**：會先自動 `pip install -r native_host/requirements.txt` 裝好全部需要的 Python 套件，再從 `manifest.json` 算出擴充功能 ID（不用自己去 `chrome://extensions` 複製），並註冊好「畫愛心人機驗證提醒」、「本地資料夾模式／debug log」、「EZproxy 重登語音驗證碼自動辨識」這三個 native messaging host。跑完按任意鍵關掉即可，回 `chrome://extensions` 把擴充功能重新整理一次。
 
 不裝這步，下載/暫停/Excel 匯出等主要功能還是能動，只是人機驗證提醒、本地資料夾模式、debug log 留痕會用不了，自動退回 Chrome 內建下載資料夾。
 

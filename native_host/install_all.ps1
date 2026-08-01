@@ -10,8 +10,9 @@
     HKCU:\Software\Google\Chrome\NativeMessagingHosts\<host name>
   pointing at that manifest (this is how Chrome discovers native hosts):
 
-    - com.pubmed_downloader.write_love    (畫愛心人機驗證提醒 / python_write_love.py)
-    - com.pubmed_downloader.file_manager  (本地資料夾模式讀寫 + debug log 留痕 / python_file_manager.py)
+    - com.pubmed_downloader.write_love      (畫愛心人機驗證提醒 / python_write_love.py)
+    - com.pubmed_downloader.file_manager    (本地資料夾模式讀寫 + debug log 留痕 / python_file_manager.py)
+    - com.pubmed_downloader.captcha_solver  (EZproxy 重登語音驗證碼辨識 / python_captcha_solver.py，選用)
 
   Equivalent to running install_write_love.ps1 and install_file_manager.ps1
   separately with the same -ExtensionId; kept as thin wrappers so either can
@@ -78,8 +79,18 @@ Install-NativeHost -Name "com.pubmed_downloader.file_manager" `
     -Description "PubMed PDF Downloader - local folder mode file manager" `
     -BatFileName "python_file_manager.bat"
 
+Install-NativeHost -Name "com.pubmed_downloader.captcha_solver" `
+    -Description "PubMed PDF Downloader - EZproxy re-login audio captcha solver" `
+    -BatFileName "python_captcha_solver.bat"
+
 Write-Host "All native messaging hosts installed for extension chrome-extension://$ExtensionId/"
+Write-Host ""
+Write-Host "Note: this only registers the native hosts. All Python packages they need"
+Write-Host "(including openai-whisper/torch for com.pubmed_downloader.captcha_solver)"
+Write-Host "are listed in requirements.txt in this folder - run"
+Write-Host "'pip install -r requirements.txt' once (一鍵安裝.bat does this automatically)."
 Write-Host ""
 Write-Host "To uninstall everything:"
 Write-Host "  Remove-Item 'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.write_love' -Force"
 Write-Host "  Remove-Item 'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.file_manager' -Force"
+Write-Host "  Remove-Item 'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.pubmed_downloader.captcha_solver' -Force"

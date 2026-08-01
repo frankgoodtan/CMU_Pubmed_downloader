@@ -623,6 +623,14 @@ function updateWorkers(workers, isPausingNow = false) {
       label = `跑完這篇後暫停... ${w.label || ""}`;
       div.className = "worker-item running";
       div.style.borderLeftColor = "#ea580c";
+    } else if (isRunning && w.stalled) {
+      // 已被標記卡住、新 worker 已頂上接手佇列，這個只是還在收尾手上這篇，
+      // 跟正常在跑的 worker 用不同圖示區分，不然使用者看到好幾個「⚙」會誤以為
+      // 全部都是正常進度，看不出其中幾個其實已經卡住太久。
+      icon  = "🛑";
+      label = `卡住中（已由新 worker 接手佇列，此篇跑完就結束）${w.label || ""}`;
+      div.className = "worker-item running";
+      div.style.borderLeftColor = "#dc2626";
     } else {
       icon  = isRunning ? "⚙" : w.status === "done" ? "✅" : w.status === "fail" ? "❌" : "💤";
       label = w.label || "待機中";

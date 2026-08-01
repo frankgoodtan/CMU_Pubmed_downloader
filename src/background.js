@@ -213,6 +213,13 @@ function resetState() {
     waitingCaptcha: false,
     captchaResolve: null,
     captchaImg:     null,
+    // 語音驗證碼自動重登用：只存在這個記憶體裡的物件（{username, password}），
+    // 絕對不寫進 chrome.storage——service worker 重啟（重新載入擴充功能、
+    // 瀏覽器關閉、或 Chrome 閒置太久自行回收 MV3 service worker）都會讓它跟著
+    // G 一起消失，下次就得重新手動輸入一次，這是刻意的（使用者要求密碼絕對
+    // 不落地）。第一次登入永遠是使用者手動輸入；只有第二次以後需要重登、且這
+    // 個物件還在時，requestLogin() 才會嘗試用語音驗證碼自動重登。
+    savedEzproxyCreds: null,
     tabPool:        [],
     domainLocks:    {},
     activeWorkers:  0,
@@ -702,7 +709,23 @@ function notifyProgress() {
 function notifyWorkers() {
   chrome.runtime.sendMessage({
     action: "WORKERS",
-    workers: G.workers.map(w => w ? { label: w.label, status: w.status } : { label: "", status: "idle" }),
+    // stalled：這個 worker 已被 checkStalledWorkers() 標記（處理單篇超過門檻，
+    // 另開新 worker 頂上了），本身還在跑完手上這篇、還沒真的結束，所以 status
+    // 仍是 "running"——沒有這個欄位，popup 只看得到 status，會跟正常在跑的
+    // worker 顯示成一模一樣的「⚙」，使用者看到好幾個「⚙」同時存在，完全看不出
+    // 哪個其實已經卡住、只是還沒收尾。
+    // 已 retired 的 worker 名額（真的結束、不會再分配工作）直接濾掉不送給
+    // popup，不是只改成 idle 顯示——這樣被卡住 worker 頂替掉的舊名額才會真的
+    // 從畫面上消失，留在畫面上的 worker 也會照送出的陣列順序自然重新編號
+    // （Worker 1、2、3...），不會看到一堆退場後的「已完成」殘影排在中間。
+    // stalled 要照原始 workerIdx 查 G.workerRetireFlags（先 map 出來），濾掉
+    // retired 那步要放在後面，不然濾掉之後的陣列位置跟原始 workerIdx 對不上，
+    // 會把 stalled 標記算到別的 worker 頭上。
+    workers: G.workers
+      .map((w, i) => w
+        ? { label: w.label, status: w.status, stalled: !!(G.workerRetireFlags && G.workerRetireFlags.has(i)), retired: !!w.retired }
+        : { label: "", status: "idle", stalled: false, retired: false })
+      .filter(w => !w.retired),
   }).catch(() => {});
 
   if (G.paused && !G.stopped && G.workers.length > 0) {
@@ -1279,7 +1302,12 @@ async function runWorker(workerIdx) {
   }
 
   chrome.tabs.remove(tabId).catch(() => {});
-  G.workers[workerIdx] = { tabId: null, pmid: null, label: "已完成", status: "idle" };
+  // retired：這個 worker 名額真的結束了（不是兩篇之間的短暫 idle），不會再被
+  // 分配任何工作——notifyWorkers() 會把這種 worker 從畫面上整列拿掉，不再顯示
+  // 「已完成」的殘影，這樣被卡住 worker 頂替掉的舊名額才會真的從並行狀態面板
+  // 消失，剩下的 worker 也會自然重新編號（例如原本顯示 Worker 3/5，退場後
+  // 畫面上會變回 Worker 1/2）。
+  G.workers[workerIdx] = { tabId: null, pmid: null, label: "已完成", status: "idle", retired: true };
   notifyWorkers();
 }
 
@@ -2637,29 +2665,92 @@ async function captureLoginCaptcha(tabId) {
   return captchaBase64;
 }
 
-async function requestLogin(tabId) {
-  addLog("需要登入 CMU EZproxy，請填入帳號...", "warn");
-  G.waitingLogin = true;
-  // 帳密/驗證碼錯誤時重新擷取驗證碼讓使用者重試，而不是直接終止整批任務
-  const MAX_LOGIN_ATTEMPTS = 3;
+// ════════════════════════════════════════════════════════════════
+// 語音驗證碼自動重登：第一次登入永遠是使用者手動輸入（見 requestLogin 下方），
+// 成功後帳密存進 G.savedEzproxyCreds（只在記憶體，見該欄位宣告處的說明）。
+// 同一個 session 之後若又被導回登入頁，requestLogin 會先嘗試這裡的自動重登
+// ——抓 <audio id="captcha_audio"> 的語音檔，丟給 native host（python_
+// captcha_solver.py，跑 OpenAI Whisper 的 tiny 模型辨識）解出數字，自動
+// 填表送出。這條路徑完全不會去讀取／顯示登入頁上的圖片驗證碼。
+// ════════════════════════════════════════════════════════════════
+const CAPTCHA_SOLVER_HOST = "com.pubmed_downloader.captcha_solver";
 
-  for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+async function captureLoginCaptchaAudio(tabId) {
+  let audioBase64 = null;
+  try {
+    let audioSrc = null;
+    for (let i = 0; i < 10; i++) {
+      const r = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const audio = document.getElementById("captcha_audio");
+          return audio && audio.src ? audio.src : null;
+        }
+      });
+      audioSrc = r?.[0]?.result;
+      if (audioSrc) break;
+      await sleep(500);
+    }
+    if (audioSrc) {
+      const resp = await fetch(audioSrc, { credentials: "include" });
+      if (resp.ok) {
+        const buf = await resp.arrayBuffer();
+        audioBase64 = bufferToBase64(buf);
+      }
+    }
+  } catch (e) {
+    addLog("  語音驗證碼擷取失敗：" + e.message, "warn");
+  }
+  return audioBase64;
+}
 
-  const captchaBase64 = await captureLoginCaptcha(tabId);
+// 呼叫一次性 spawn 的 native host（跟 write_love 同一種呼叫方式，不是
+// file_manager 那種長駐 Port）：送出 base64 wav，換回辨識出的數字字串。
+// host 沒裝、辨識失敗、或辨識不出任何數字都回傳 null，呼叫端自己決定要不要
+// 換一組驗證碼重試或退回手動輸入，不會讓整批下載卡住。
+function solveCaptchaAudioViaNativeHost(audioBase64) {
+  return new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(
+        CAPTCHA_SOLVER_HOST,
+        { cmd: "solve_audio", audioB64: audioBase64 },
+        response => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            addThreadLog("Captcha audio solver unavailable (host not installed?)", { error: err.message });
+            resolve(null);
+            return;
+          }
+          if (response?.ok && response.digits) {
+            resolve(response.digits);
+          } else {
+            addThreadLog("Captcha audio solver failed", { error: response?.error || "unknown", raw: response?.raw });
+            resolve(null);
+          }
+        }
+      );
+    } catch (e) {
+      addThreadLog("Captcha audio solver threw", { error: e.message });
+      resolve(null);
+    }
+  });
+}
 
-  chrome.runtime.sendMessage({
-    action:     "NEED_LOGIN",
-    captchaImg: captchaBase64,
-    retry:      attempt > 1,
-  }).catch(() => {});
+// 點登入頁上的「換一組」連結拿新的一組驗證碼（圖片跟語音是同一組 hashkey 配對
+// 產生的，點一次兩邊都會換新）。自動重登辨識錯誤時用這個換下一組再試，不會
+// 一直對同一組讀不出來的驗證碼重試。
+async function refreshLoginCaptcha(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => { document.getElementById("refresh_captcha")?.click(); }
+    });
+    await sleep(800);
+  } catch {}
+}
 
- 
-  const creds = await new Promise(resolve => { G.loginResolve = resolve; });
-  if (!creds || G.stopped) { G.waitingLogin = false; return; }
-
-  addLog("  已收到帳號，正在填入表單並送出...", "info");
-
- 
+// 填入登入表單並送出；手動登入、自動重登兩條路徑共用同一段。
+async function submitLoginForm(tabId, username, password, captcha) {
   try {
     const submitResult = await chrome.scripting.executeScript({
       target: { tabId },
@@ -2702,29 +2793,97 @@ async function requestLogin(tabId) {
 
         return { ok: true, action: form.getAttribute("action") || "" };
       },
-      args: [creds.username, creds.password, creds.captcha || ""]
+      args: [username, password, captcha || ""]
     });
     const res = submitResult?.[0]?.result;
     if (!res?.ok) addLog("  登入表單送出失敗：" + (res?.reason || "unknown"), "warn");
     else addLog("  已送出登入表單：" + (res.action || "(current form)"), "info");
-  } catch(e) {
+  } catch (e) {
     addLog("  自動填入登入資料失敗：" + e.message, "warn");
   }
+}
 
+// 送出表單後等一下，看有沒有離開登入頁（判定成功／失敗的唯一依據，跟原本
+// requestLogin 內建的邏輯一致）。
+async function checkLoginSucceeded(tabId) {
   await sleep(3000);
-
   const finalTab = await chrome.tabs.get(tabId).catch(() => null);
   const finalUrl = finalTab?.url || "";
-  const stillOnLoginPage = finalUrl.includes("/user/login") || finalUrl.includes("/proxy/login");
-  if (!stillOnLoginPage) {
-    addLog("  登入成功", "ok");
-    G.waitingLogin = false;
-    // 只有真的成功才通知 popup 成功；失敗會回到迴圈頂端拿新驗證碼重試
-    chrome.runtime.sendMessage({ action: "LOGIN_OK" }).catch(() => {});
-    return;
-  }
-  addLog(`  登入後仍在登入頁面（第 ${attempt}/${MAX_LOGIN_ATTEMPTS} 次），帳密或驗證碼可能錯誤`, "warn");
+  return !(finalUrl.includes("/user/login") || finalUrl.includes("/proxy/login"));
+}
 
+async function requestLogin(tabId) {
+  addLog("需要登入 CMU EZproxy，請填入帳號...", "warn");
+  G.waitingLogin = true;
+
+  // 已經記住帳密（這次執行不是第一次登入）：先試語音驗證碼自動重登，不跳出
+  // 手動輸入的 popup。辨識不是 100% 準，失敗就換一組驗證碼重試，MAX_AUTO_
+  // ATTEMPTS 次都失敗才真的退回下面手動輸入流程——不會因為辨識偶爾錯誤就
+  // 讓整批下載卡住等使用者，但也不會無限重試（避免頻繁登入嘗試觸發校方更
+  // 嚴格的風控）。
+  if (G.savedEzproxyCreds && !G.stopped) {
+    const MAX_AUTO_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_AUTO_ATTEMPTS; attempt++) {
+      if (G.stopped) { G.waitingLogin = false; return; }
+
+      const audioB64 = await captureLoginCaptchaAudio(tabId);
+      if (!audioB64) {
+        addLog("  自動重登：語音驗證碼擷取失敗，改用手動登入。", "warn");
+        break;
+      }
+      const digits = await solveCaptchaAudioViaNativeHost(audioB64);
+      if (!digits) {
+        addLog(`  自動重登：語音驗證碼辨識失敗（第 ${attempt}/${MAX_AUTO_ATTEMPTS} 次），換一組再試。`, "warn");
+        if (attempt < MAX_AUTO_ATTEMPTS) await refreshLoginCaptcha(tabId);
+        continue;
+      }
+
+      addLog(`  自動重登：語音驗證碼辨識為「${digits}」，正在自動填入表單並送出（第 ${attempt}/${MAX_AUTO_ATTEMPTS} 次）...`, "info");
+      await submitLoginForm(tabId, G.savedEzproxyCreds.username, G.savedEzproxyCreds.password, digits);
+
+      if (await checkLoginSucceeded(tabId)) {
+        addLog("  自動重登成功。", "ok");
+        G.waitingLogin = false;
+        chrome.runtime.sendMessage({ action: "LOGIN_OK" }).catch(() => {});
+        return;
+      }
+      addLog(`  自動重登後仍在登入頁面（第 ${attempt}/${MAX_AUTO_ATTEMPTS} 次），可能辨識錯誤或帳密已失效，換一組再試。`, "warn");
+      if (attempt < MAX_AUTO_ATTEMPTS) await refreshLoginCaptcha(tabId);
+    }
+    addLog("  自動重登連續失敗，改退回手動登入。", "warn");
+  }
+
+  // 帳密/驗證碼錯誤時重新擷取驗證碼讓使用者重試，而不是直接終止整批任務
+  const MAX_LOGIN_ATTEMPTS = 3;
+
+  for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+    if (G.stopped) { G.waitingLogin = false; return; }
+
+    const captchaBase64 = await captureLoginCaptcha(tabId);
+
+    chrome.runtime.sendMessage({
+      action:     "NEED_LOGIN",
+      captchaImg: captchaBase64,
+      retry:      attempt > 1,
+    }).catch(() => {});
+
+    const creds = await new Promise(resolve => { G.loginResolve = resolve; });
+    if (!creds || G.stopped) { G.waitingLogin = false; return; }
+
+    addLog("  已收到帳號，正在填入表單並送出...", "info");
+    await submitLoginForm(tabId, creds.username, creds.password, creds.captcha || "");
+
+    if (await checkLoginSucceeded(tabId)) {
+      addLog("  登入成功", "ok");
+      G.waitingLogin = false;
+      // 記住這組帳密（只存在記憶體，見 G.savedEzproxyCreds 宣告處的說明），
+      // 下次同一個 session 需要重登時就能先嘗試語音自動重登。
+      G.savedEzproxyCreds = { username: creds.username, password: creds.password };
+      // 只有真的成功才通知 popup 成功；失敗會回到迴圈頂端拿新驗證碼重試
+      chrome.runtime.sendMessage({ action: "LOGIN_OK" }).catch(() => {});
+      return;
+    }
+    addLog(`  登入後仍在登入頁面（第 ${attempt}/${MAX_LOGIN_ATTEMPTS} 次），帳密或驗證碼可能錯誤`, "warn");
   }
 
   addLog("已連續登入失敗 " + MAX_LOGIN_ATTEMPTS + " 次，放棄本次登入。", "fail");
@@ -2960,8 +3119,16 @@ function shouldRemoveCookie(cookie, mode = "routine") {
   // 例行清理只移除追蹤/分析 cookie，避免每 10 篇破壞出版社授權或 challenge session。
   if (mode === "routine") return isTrackingCookieName(cookie.name);
 
-  // header 過大時才較積極，但仍保留看起來像登入、授權、session、token 的 cookie。
+  // header 過大時才較積極，但仍保留看起來像登入、授權、session、token 的 cookie
+  // ——除了 CNKI 自己那組 proxy 子網域：CNKI 的 Ecp_LoginStuts/LID 這類 cookie
+  // 名稱剛好也會被 isLikelyAuthOrSessionCookieName 誤判成「該保留的登入態」而
+  // 逃過清理，但這正是 CNKI session 累積壞掉時真正需要清掉重建的那個 cookie
+  // （見 isCnkiProxyDomain 上面的說明、chinese_paper_search.js 的
+  // isCnkiLoginWallTab）——不清掉的話，觸發積極清理也是白清，CNKI 那組髒
+  // session 照樣留著，下次還是會被導去登入頁。這裡用網域覆寫掉名稱那條保留
+  // 規則，只對 CNKI 這一個 proxy 網域生效，不影響其他出版商的登入態保護。
   if (mode === "header-too-large") {
+    if (isCnkiProxyDomain(cookie.domain)) return true;
     if (isLikelyAuthOrSessionCookieName(cookie.name)) return false;
     return true;
   }
@@ -3018,9 +3185,12 @@ function cookieCleanupReasonLabel(reason) {
 }
 
 function cookieCleanupShouldRestartItem(reason) {
+  // CNKI session 疑似失效（見 chinese_paper_search.js isCnkiLoginWallTab）也要走
+  // 積極清理模式：這種情況是 CNKI 自己那組 session cookie 髒掉/被反爬蟲機制盯上，
+  // 例行清理（只清追蹤 cookie）救不了，需要跟 header-too-large 一樣整批清掉重建。
   return reason === "header-too-large" ||
          String(reason || "").includes("proxy 連線錯誤") ||
-         String(reason || "").includes("proxy 連線錯誤");
+         String(reason || "").includes("CNKI session");
 }
 
 async function waitForCookieCleanup(workerIdx = -1) {
@@ -3263,7 +3433,12 @@ function fmHandleMessage(msg) {
     msg.dataB64 = p.chunks.join("");
   }
   fmPending.delete(msg.id);
-  if (msg.ok) p.resolve(msg);
+  // cmd_pick_folder 使用者按「取消」時回 {ok:false, cancelled:true}，這是正常
+  // 操作不是錯誤——沒有這個特例，一律把 ok:false 當 reject 處理，會讓
+  // PICK_LOCAL_FOLDER 的 .then() 分支（本來就準備好要處理 cancelled）永遠走不到，
+  // 全部落進 .catch()，因為沒有 error 欄位而顯示成嚇人的「native host 回報失敗」，
+  // 但其實只是使用者關掉了資料夾選擇視窗，native host 本身完全正常。
+  if (msg.ok || msg.cancelled) p.resolve(msg);
   else p.reject(new Error(msg.error || "native host 回報失敗"));
 }
 
@@ -4083,6 +4258,21 @@ function normalizePdfCandidates(result, fallbackPdfUrl = null) {
 // 下載前預檢：抓 URL 開頭數 KB，確認回應真的是 PDF。
 // 回傳 true=確定是 PDF、false=確定不是（HTML/錯誤頁）、null=無法判定（照常嘗試下載）
 // 選填 diag 物件：填入 { status, contentType, verdict, reason, snippet } 供 debug 用。
+// 有些小型出版商（例如 journaltcm.cn 的 downloadArticleFile.do）的下載端點會做
+// 防盜連：檢查請求的 Referer 是不是同一個網域，沒有 Referer（background 這裡
+// 用 fetch() 直接發請求，本來就不會自動帶上）就直接 403——實測過（curl 手動比對）：
+// 帶不帶這個 Referer 是唯一差異，帶了就是 200 + 真檔案，不帶就是 403。fetch() 的
+// referrer 選項可以自行指定成目標網址自己的網域，模擬「從同一個網站點過去」，
+// 對不檢查 Referer 的站台沒有副作用（多數站台根本不管這個欄位），對會檢查的站台
+// 剛好補上這個防護要的東西。
+function sameOriginReferrer(url) {
+  try {
+    return new URL(url).origin + "/";
+  } catch {
+    return undefined;
+  }
+}
+
 async function preflightPdfCheck(url, diag = null) {
   const setDiag = o => { if (diag) Object.assign(diag, o); };
   const ctrl = new AbortController();
@@ -4092,6 +4282,7 @@ async function preflightPdfCheck(url, diag = null) {
     const resp = await fetch(url, {
       credentials: "include",
       headers: { "Range": "bytes=0-2047" },
+      referrer: sameOriginReferrer(url),
       signal: ctrl.signal,
     });
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
@@ -4761,7 +4952,9 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
   const localCfg = await getLocalFolderConfig();
   if (localCfg.enabled) {
     try {
-      const resp = await fetch(pdfUrl, { credentials: "include" });
+      // referrer: 同 preflightPdfCheck() 那份說明——防盜連站台需要看到同網域的
+      // Referer 才會放行下載，這裡跟預檢用同一招。
+      const resp = await fetch(pdfUrl, { credentials: "include", referrer: sameOriginReferrer(pdfUrl) });
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       const buf = await resp.arrayBuffer();
       if (!looksLikePdfBytes(buf, resp.headers.get("content-type"))) {

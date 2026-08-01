@@ -3,10 +3,11 @@ extension_key.pem
 *.pem
 
 # native host manifest：install_*.ps1 / setup.ps1 每次執行都會用「這台電腦上的
-# 絕對路徑」覆寫這兩個檔案，換一台電腦內容就是錯的，不該進版控（見
+# 絕對路徑」覆寫這三個檔案，換一台電腦內容就是錯的，不該進版控（見
 # native_host/安裝說明.txt）
 native_host/com.pubmed_downloader.write_love.json
 native_host/com.pubmed_downloader.file_manager.json
+native_host/com.pubmed_downloader.captcha_solver.json
 
 # native host 執行期間自動產生的除錯/留痕資料夾，機器本地狀態，不進版控
 native_host/file_manager_debug/
