@@ -1308,6 +1308,15 @@ async function runWorker(workerIdx) {
   // 消失，剩下的 worker 也會自然重新編號（例如原本顯示 Worker 3/5，退場後
   // 畫面上會變回 Worker 1/2）。
   G.workers[workerIdx] = { tabId: null, pmid: null, label: "已完成", status: "idle", retired: true };
+  // workerRetireFlags 這個 Set 只在 checkStalledWorkers() 判定卡住那一刻加進去
+  // （見該函式），退場之後這個索引再也不會被用到（G.nextWorkerIdx 只增不減，
+  // 同一個索引不會被回收派給下一個新 worker），留著這個索引在 Set 裡不會造成
+  // 任何邏輯錯誤，但也永遠沒有機會被清掉——長時間跑下來、卡住次數一多，這個
+  // Set 會一直往上長，這裡主動清掉，讓它跟這個 worker 名額的生命週期一致結束。
+  G.workerRetireFlags.delete(workerIdx);
+  // 同理，這個索引的分頁已經關閉、不會再被任何 worker 借用，清掉舊的分頁 id
+  // 殘影，避免之後有人誤用這個陣列去查「目前這個 workerIdx 的分頁是哪個」。
+  G.tabPool[workerIdx] = null;
   notifyWorkers();
 }
 
