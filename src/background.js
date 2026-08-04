@@ -4918,11 +4918,17 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
   let check = await preflightPdfCheck(pdfUrl, diag);
   rec("預檢：" + formatPreflightDiag(diag));
 
-  // 預檢拿到的不是 PDF，但這是已知會用反爬蟲挑戰擋直接下載的站台：
-  // 在真實分頁裡把挑戰解開後，同一個 URL 就能下載到真 PDF。
-  if (check !== true && tabId != null && urlNeedsChallengeWarmup(pdfUrl)) {
+  // 預檢拿到的不是 PDF：可能是已知會用反爬蟲挑戰擋直接下載的站台（PMC/ScienceDirect），
+  // 也可能是隨便哪個網站臨時被 Cloudflare 擋了一頁「Just a moment...」——這種通用挑戰
+  // 通常不需要真人操作，幾秒內會自動解開，同一個 URL 之後就會回真 PDF。不管是哪一種，
+  // 都值得先在真實分頁裡等它自己解開、拿到通行 cookie 後重新預檢，而不是預檢一失敗
+  // 就馬上放棄候選、把整批任務暫停等真人來按（真人真的需要動手的挑戰，warmUpAntiBotChallenge
+  // 輪詢逾時後一樣會自動觸發暫停，不會被吃掉）。
+  const attemptedWarmup = check !== true && tabId != null &&
+    (urlNeedsChallengeWarmup(pdfUrl) || diag.manualVerification);
+  if (attemptedWarmup) {
     addThreadLog("Preflight not a PDF; attempting anti-bot warmup in tab", { pdfUrl, check });
-    rec("非 PDF 且屬已知反爬蟲站台 → 嘗試分頁預熱");
+    rec("非 PDF 且疑似反爬蟲挑戰頁 → 嘗試分頁預熱");
     if (await warmUpAntiBotChallenge(tabId, pdfUrl, trace)) {
       addThreadLog("Anti-bot warmup cleared; PDF now served", { pdfUrl });
       rec("預熱成功，改判定為 PDF、繼續下載");
@@ -4934,9 +4940,9 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
   }
 
   if (check === false) {
-    // 非 warmup 站台（如 Wiley/Springer 的 Cloudflare）遇到人機驗證：一樣暫停等使用者通過。
-    // warmup 站台（ScienceDirect 等）的驗證已在 warmUpAntiBotChallenge 內處理過。
-    if (diag.manualVerification && G.manualVerifyPause && !G.stopped && !urlNeedsChallengeWarmup(pdfUrl)) {
+    // 有進過 warmup 的候選：需不需要暫停等真人完成驗證，warmUpAntiBotChallenge
+    // 內部輪詢逾時時已經處理過了，這裡不用再重複觸發一次暫停。
+    if (diag.manualVerification && G.manualVerifyPause && !G.stopped && !attemptedWarmup) {
       rec("偵測到人機驗證頁，已開啟驗證分頁等待使用者完成，通過後自動重試此篇。");
       // 驗證頁必須開在「真的被擋下來的那個網址」上使用者才看得到挑戰畫面：
       // 之前直接開新分頁只帶著 URL、沒有先導航，常常變成一個空白/看不到驗證的分頁。
