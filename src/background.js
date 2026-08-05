@@ -4508,12 +4508,22 @@ async function tabShowsNativePdfViewer(tabId) {
 // 反覆重跑）。這裡改用跟 Ovid（downloadInlinePdfViaTabNavigation）同一招：既然分頁
 // 已經確定顯示真 PDF，直接用 chrome.debugger 的 Page.printToPDF 把分頁目前顯示的
 // 內容截下來存檔，完全繞開會被擋下的背景 fetch。
+// document.contentType 一變成 application/pdf，只代表「這次導航拿到的資源是
+// PDF」，不代表 Chrome 內建 PDF 檢視器（那個包在 closed shadow DOM 裡的元件）已經
+// 把字型、分頁內容真的渲染完成——跟 downloadInlinePdfViaTabNavigation（Ovid 那條路）
+// 已知同一個現象：太早呼叫 Page.printToPDF 會截到還沒畫完的畫面，內容被截斷/不完整，
+// 而不是拿到真正完整的頁面。這裡用兩層防呆：(1) 固定多等一段時間讓內部渲染跟上，
+// (2) 截出來的內容明顯過小（正常一篇論文含嵌入字型不可能只有幾 KB）時，當作還沒
+// 準備好，回傳 false 讓外層每 1.5 秒一次的輪詢自然重試，不會把半成品存成「成功」。
+const NATIVE_PDF_RENDER_SETTLE_MS = 1500;
+const MIN_CAPTURED_PDF_BYTES = 20000;
 async function captureNativePdfViewerToFile(tabId, safeTitle, folder, trace) {
   const rec = line => { if (Array.isArray(trace)) trace.push(traceStamp() + line); };
   if (!chrome.debugger) {
     rec("  分頁已顯示真 PDF，但沒有 chrome.debugger 權限，無法截取");
     return false;
   }
+  await sleep(NATIVE_PDF_RENDER_SETTLE_MS);
   const target = { tabId };
   let attached = false;
   try {
@@ -4523,6 +4533,11 @@ async function captureNativePdfViewerToFile(tabId, safeTitle, folder, trace) {
     const result = await debuggerSendCommand(target, "Page.printToPDF", { printBackground: true });
     if (!result?.data) {
       rec("  分頁已顯示真 PDF，但 Chrome 沒有回傳截取內容");
+      return false;
+    }
+    const approxBytes = Math.floor(result.data.length * 3 / 4);
+    if (approxBytes < MIN_CAPTURED_PDF_BYTES) {
+      rec("  分頁截取內容過小（約 " + approxBytes + " bytes），檢視器可能還沒渲染完成，暫不採用");
       return false;
     }
     const ok = await downloadBase64Pdf(result.data, safeTitle, folder, trace);
