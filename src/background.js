@@ -4511,6 +4511,16 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
   const diag = {};
   let warmupPollCount = 0;
   let warmupSnapshotTaken = false;
+  // 「疑似驗證頁」這個訊號本身無法區分兩種完全不同的情況：(a) Cloudflare「Just a
+  // moment...」這類純 JS 自動挑戰，通常幾秒內自己解開，解開前的每一次輪詢原本就一定
+  // 會命中這個訊號；(b) 真的需要真人點擊/輸入的挑戰（Turnstile checkbox 等），不管等
+  // 多久都不會自己過。第一次看到這個訊號就直接判定「需要真人」會把 (a) 也錯殺——實測
+  // 觀察到的案例是：導頁後 4 秒、只輪詢了 1 次就秒退，離下面的 45 秒逾時還差得遠。
+  // 所以這裡改成「連續看到這個訊號」也要撐過一段寬限期，才真的判定為需要真人；寬限期
+  // 內持續當作「還在自動解開中」，繼續輪詢重新預檢，直到訊號消失（挑戰過了，下一輪
+  // preflight 應該就會直接拿到真 PDF）或寬限期用盡（大機率是真的需要真人）。
+  const CHALLENGE_GRACE_MS = 20000;
+  let challengeFirstSeenAt = null;
   while (Date.now() < deadline) {
     warmupPollCount++;
     const check = await preflightPdfCheck(pdfUrl, diag);
@@ -4519,9 +4529,15 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
     // （有些挑戰只針對「非導航」的請求另外處理，fetch 可能逾時或回一個沒有關鍵字的
     // 頁面），單靠 preflightPdfCheck 的文字比對可能漏掉；這裡多補一個訊號：直接看
     // 分頁本身（已經導航到 warmUrl，很多時候 warmUrl 就是同一個簽名網址）現在是不是
-    // 正顯示著驗證挑戰的 DOM 元件，兩個訊號任一個成立就視為需要人工驗證。
+    // 正顯示著驗證挑戰的 DOM 元件，兩個訊號任一個成立就視為疑似驗證頁。
     const domShowsChallenge = !diag.manualVerification && await tabShowsManualVerification(tabId);
     if (diag.manualVerification || domShowsChallenge) {
+      if (challengeFirstSeenAt == null) challengeFirstSeenAt = Date.now();
+      if (Date.now() - challengeFirstSeenAt < CHALLENGE_GRACE_MS) {
+        // 寬限期內：當作自動挑戰還在跑，繼續輪詢，不急著判定要真人介入
+        await sleep(1500);
+        continue;
+      }
       if (G.manualVerifyPause && !G.stopped) {
         // 暫停整批任務、開前景分頁等使用者手動通過驗證；
         // 本篇先以失敗收場，驗證完成後 worker 迴圈會自動從頭重跑此篇
@@ -4540,6 +4556,9 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
       addThreadLog("Manual verification required; keeping item retryable", { pdfUrl });
       return false;
     }
+    // 這輪沒看到驗證訊號：重置寬限期計時器，避免下次瞬間又閃過一次就被誤判成
+    // 「已經拖了很久」（例如挑戰在兩次輪詢之間短暫消失又重新出現的邊緣情況）。
+    challengeFirstSeenAt = null;
     // 兩個訊號都沒偵測到、頁面也還不是真 PDF：撐過前幾次輪詢（給 DOM 足夠時間渲染）
     // 仍然這樣，很可能卡在目前選擇器/關鍵字都認不出來的挑戰頁變體（例如 Cloudflare
     // Turnstile 用了客製網域，iframe src 不含 challenges.cloudflare.com/turnstile 字樣，
