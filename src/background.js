@@ -4527,16 +4527,29 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
     if (check === true) { rec("  預熱後預檢：已回傳真 PDF"); return true; }
     // 背景 fetch() 打這種 Cloudflare/AWS 簽名網址不一定跟真人分頁拿到一樣的回應
     // （有些挑戰只針對「非導航」的請求另外處理，fetch 可能逾時或回一個沒有關鍵字的
-    // 頁面），單靠 preflightPdfCheck 的文字比對可能漏掉；這裡多補一個訊號：直接看
-    // 分頁本身（已經導航到 warmUrl，很多時候 warmUrl 就是同一個簽名網址）現在是不是
-    // 正顯示著驗證挑戰的 DOM 元件，兩個訊號任一個成立就視為疑似驗證頁。
-    const domShowsChallenge = !diag.manualVerification && await tabShowsManualVerification(tabId);
+    // 頁面，甚至對某些站台永遠回驗證頁字樣，不管分頁本身早就過關了沒有），單靠
+    // preflightPdfCheck 的文字比對可能誤判；這裡一定要真的去看一次分頁本身（已經
+    // 導航到 warmUrl）現在是不是正顯示著驗證挑戰的 DOM 元件——不能因為背景 fetch
+    // 已經說「是驗證頁」就跳過這個檢查，不然對「背景 fetch 永遠誤判、分頁其實正常」
+    // 的站台，會一直只採信背景 fetch 那個錯的訊號，誤報「偵測到需要人工驗證」，
+    // 即使分頁當下根本沒有顯示任何驗證畫面。
+    const domShowsChallenge = await tabShowsManualVerification(tabId);
     if (diag.manualVerification || domShowsChallenge) {
       if (challengeFirstSeenAt == null) challengeFirstSeenAt = Date.now();
       if (Date.now() - challengeFirstSeenAt < CHALLENGE_GRACE_MS) {
         // 寬限期內：當作自動挑戰還在跑，繼續輪詢，不急著判定要真人介入
         await sleep(1500);
         continue;
+      }
+      // 寬限期用盡：是不是真的要叫使用者去驗證，只看分頁「現在」的真實狀態
+      // （domShowsChallenge），不能只看背景 fetch 的訊號——分頁已經沒有顯示驗證
+      // 畫面的話，代表這不是真人驗證的問題，是下載機制本身（背景 fetch）拿不到
+      // 內容，暫停整批任務叫使用者去驗證一個根本不存在的畫面只會製造困惑。
+      if (!domShowsChallenge) {
+        rec("  背景 fetch 持續判定為驗證頁，但分頁本身已經沒有顯示驗證畫面——研判是此站台的下載請求被擋（可能只擋非導航請求），非真人驗證問題，暫無法自動處理。");
+        addThreadLog("Background fetch still flags a challenge but the tab shows none; likely fetch-only blocking rather than a real human-verification case", { pdfUrl });
+        G.lastPdfFailureReason = "下載失敗：分頁本身可正常顯示，但下載請求持續被擋（可能只擋非導航請求），非人工驗證問題，暫無法自動處理。URL: " + pdfUrl;
+        return false;
       }
       if (G.manualVerifyPause && !G.stopped) {
         // 暫停整批任務、開前景分頁等使用者手動通過驗證；
