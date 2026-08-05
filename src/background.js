@@ -4483,12 +4483,74 @@ async function downloadInlinePdfViaTabNavigation(tabId, pdfUrl, safeTitle, folde
   }
 }
 
+// 分頁本身已經顯示 Chrome 內建 PDF 檢視器時，document.contentType 會是
+// "application/pdf"——這是瀏覽器對「這次導航實際拿到的內容」的判定，屬於 top-level
+// Document 的標準屬性，不受 PDF 檢視器整個 UI 都包在 closed shadow DOM 裡影響（一般
+// 腳本進不去 shadow DOM 找按鈕，但這個屬性查得到）。用這個訊號判斷「分頁現在是不是
+// 已經真的顯示出真 PDF」，比再去猜 DOM 結構或選擇器可靠。
+async function tabShowsNativePdfViewer(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => document.contentType === "application/pdf",
+    });
+    return results?.[0]?.result === true;
+  } catch {
+    return false;
+  }
+}
+
+// 有些站台的反爬蟲挑戰只擋「非導航」的請求：分頁真人整頁導航一過就正常顯示出真
+// PDF（Chrome 內建 PDF 檢視器接手），但 preflightPdfCheck() 用的背景 fetch()（缺少
+// Sec-Fetch-Mode: navigate 等瀏覽器自動夾帶、無法用 JS 偽造的表頭）卻可能被同一個
+// 挑戰持續擋下去，不管等多久都不會回真 PDF——這不是「還沒解開」的時間問題，調寬限
+// 期也沒用（實測案例：分頁明明已經顯示出完整 5 頁文章內容，下載卻一直失敗、整篇
+// 反覆重跑）。這裡改用跟 Ovid（downloadInlinePdfViaTabNavigation）同一招：既然分頁
+// 已經確定顯示真 PDF，直接用 chrome.debugger 的 Page.printToPDF 把分頁目前顯示的
+// 內容截下來存檔，完全繞開會被擋下的背景 fetch。
+async function captureNativePdfViewerToFile(tabId, safeTitle, folder, trace) {
+  const rec = line => { if (Array.isArray(trace)) trace.push(traceStamp() + line); };
+  if (!chrome.debugger) {
+    rec("  分頁已顯示真 PDF，但沒有 chrome.debugger 權限，無法截取");
+    return false;
+  }
+  const target = { tabId };
+  let attached = false;
+  try {
+    await debuggerAttach(target, "1.3");
+    attached = true;
+    await debuggerSendCommand(target, "Page.enable", {});
+    const result = await debuggerSendCommand(target, "Page.printToPDF", { printBackground: true });
+    if (!result?.data) {
+      rec("  分頁已顯示真 PDF，但 Chrome 沒有回傳截取內容");
+      return false;
+    }
+    const ok = await downloadBase64Pdf(result.data, safeTitle, folder, trace);
+    if (ok) rec("  結果：下載成功（改用分頁截取，繞開會被擋下的背景 fetch）");
+    return ok;
+  } catch (e) {
+    rec("  分頁截取過程發生例外（" + (e?.message || e) + "）");
+    return false;
+  } finally {
+    if (attached) { try { await debuggerDetach(target); } catch {} }
+  }
+}
+
 // 把分頁導到 PDF 網址，讓分頁自己的 JS 解開反爬蟲挑戰並設好 cookie。
 // 判斷是否過關的信號直接沿用 preflightPdfCheck：一旦挑戰通過、cookie 進了瀏覽器的
 // cookie jar，同一個 URL 的 fetch 就會開始回真 PDF（head 出現 %PDF）→ 回傳 true。
 // 這比去猜各家 cookie 名稱更穩，對 PMC POW 與 ScienceDirect challenge 通用。
-async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
+// 回傳值有三種：true＝背景 fetch 已確認拿得到真 PDF，交回一般下載流程；
+// "captured"＝已經直接從分頁截取存檔完成，呼叫端不用再做任何下載動作；
+// false＝失敗或已轉為等待人工驗證。
+async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null, safeTitle = null, folder = "PubMed_PDFs") {
   const rec = line => { if (Array.isArray(trace)) trace.push(traceStamp() + line); };
+  const tryCaptureFromTab = async () => {
+    if (!safeTitle) return false;
+    if (!(await tabShowsNativePdfViewer(tabId))) return false;
+    rec("  分頁本身已顯示真 PDF（Chrome 內建檢視器），改為直接截取分頁內容");
+    return await captureNativePdfViewerToFile(tabId, safeTitle, folder, trace);
+  };
   // 決定要在分頁裡打開哪個網址來「觸發並通過」反爬蟲挑戰。
   // ScienceDirect 的 pdfft 是下載端點，直接開它分頁無法自行過 challenge（實測 warmup
   // 從不 cleared）。正常流程是先看「文章頁」讓 challenge 在那通過、設好 clearance cookie，
@@ -4523,6 +4585,9 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
   let challengeFirstSeenAt = null;
   while (Date.now() < deadline) {
     warmupPollCount++;
+    // 每輪先便宜地問一次分頁本身是不是已經顯示出真 PDF——這個訊號比背景 fetch 準，
+    // 一旦成立就直接截取存檔、立刻結束，不用再等下面的背景 fetch 或寬限期。
+    if (await tryCaptureFromTab()) return "captured";
     const check = await preflightPdfCheck(pdfUrl, diag);
     if (check === true) { rec("  預熱後預檢：已回傳真 PDF"); return true; }
     // 背景 fetch() 打這種 Cloudflare/AWS 簽名網址不一定跟真人分頁拿到一樣的回應
@@ -4538,6 +4603,10 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
         await sleep(1500);
         continue;
       }
+      // 寬限期用盡、背景 fetch 仍判定為驗證頁：再確認一次分頁是否其實已經顯示真
+      // PDF（背景 fetch 被擋、但分頁早就過關的情況），有的話直接截取，不用真的
+      // 驚動使用者去按「我已完成驗證」。
+      if (await tryCaptureFromTab()) return "captured";
       if (G.manualVerifyPause && !G.stopped) {
         // 暫停整批任務、開前景分頁等使用者手動通過驗證；
         // 本篇先以失敗收場，驗證完成後 worker 迴圈會自動從頭重跑此篇
@@ -4574,6 +4643,9 @@ async function warmUpAntiBotChallenge(tabId, pdfUrl, trace = null) {
     }
     await sleep(1500);
   }
+  // 逾時放棄前最後再確認一次分頁狀態：背景 fetch 45 秒都沒回真 PDF，不代表分頁本身
+  // 沒有——可能就是同一個「只擋非導航請求」的挑戰。
+  if (await tryCaptureFromTab()) return "captured";
   rec("  預熱逾時；最後一次預檢：" + formatPreflightDiag(diag));
   if (warmupSnapshotTaken) {
     rec("  ⚠ 逾時前曾偵測到「非 PDF 但也無法辨識為已知驗證頁」的狀態，已將頁面快照存進 debug log，供之後調整偵測規則使用。");
@@ -4948,7 +5020,14 @@ async function triggerDownload(pdfUrl, safeTitle, folder = "PubMed_PDFs", tabId 
   if (attemptedWarmup) {
     addThreadLog("Preflight not a PDF; attempting anti-bot warmup in tab", { pdfUrl, check });
     rec("非 PDF 且疑似反爬蟲挑戰頁 → 嘗試分頁預熱");
-    if (await warmUpAntiBotChallenge(tabId, pdfUrl, trace)) {
+    const warmupResult = await warmUpAntiBotChallenge(tabId, pdfUrl, trace, safeTitle, folder);
+    if (warmupResult === "captured") {
+      // 分頁本身早就顯示出真 PDF，已經直接截取存檔完成——常見於「挑戰只擋非導航
+      // 請求」的站台，背景 fetch 永遠拿不到真 PDF，不用再走下面一般的下載流程。
+      addThreadLog("Anti-bot warmup: captured PDF directly from tab", { pdfUrl });
+      return true;
+    }
+    if (warmupResult) {
       addThreadLog("Anti-bot warmup cleared; PDF now served", { pdfUrl });
       rec("預熱成功，改判定為 PDF、繼續下載");
       check = true;
